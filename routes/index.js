@@ -1,0 +1,9 @@
+export { AuthRouter } from "./authRoutes.js";
+export { PostRouter } from "./postRoutes.js";
+export { RestaurantRouter } from "./restaurantRoutes.js";
+export { ReviewRouter } from "./reviewRoutes.js";
+export { AdminRouter } from "./adminRoutes.js";
+export { FavoriteRouter } from "./favoriteRoutes.js";
+export { UserRouter } from "./userRoutes.js";
+export { FeedRouter } from "./feedRoutes.js";
+export { NotificationRouter } from "./notificationRoutes.js";

@@ -1,0 +1,9 @@
+export { User } from "./user.model.js";
+export { OTP } from "./otp.model.js";
+export { Post } from "./post.model.js";
+export { Restaurant } from "./restaurant.model.js";
+export { Review } from "./review.model.js";
+export { Report } from "./report.model.js";
+export { FavoriteList } from "./favoriteList.model.js";
+export { Settings } from "./settings.model.js";
+export { Notification } from "./notification.model.js";

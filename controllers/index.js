@@ -1,0 +1,9 @@
+export * as authController from "./authController.js";
+export * as postController from "./postController.js";
+export * as restaurantController from "./restaurantController.js";
+export * as reviewController from "./reviewController.js";
+export * as adminController from "./adminController.js";
+export * as favoriteController from "./favoriteController.js";
+export * as userController from "./userController.js";
+export * as feedController from "./feedController.js";
+export * as notificationController from "./notificationController.js";
