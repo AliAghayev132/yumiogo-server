@@ -7,3 +7,4 @@ export * as favoriteController from "./favoriteController.js";
 export * as userController from "./userController.js";
 export * as feedController from "./feedController.js";
 export * as notificationController from "./notificationController.js";
+export * as uploadController from "./uploadController.js";

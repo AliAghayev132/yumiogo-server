@@ -177,8 +177,7 @@ class SeedService {
 
     // Reports
     const someReviews = await Review.find().limit(3);
-    let reports = 0;
-    for (let i = 0; i < REPORTS.length; i += 1) {
+    let reports = 0; for (let i = 0; i < REPORTS.length; i += 1) {
       const r = REPORTS[i];
       let targetId;
       let targetLabel;

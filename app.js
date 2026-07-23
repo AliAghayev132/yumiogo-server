@@ -31,6 +31,7 @@ import {
   UserRouter,
   FeedRouter,
   NotificationRouter,
+  UploadRouter,
 } from "#routes";
 
 // ============ APP INSTANCE ============
@@ -117,6 +118,7 @@ const setupRoutes = (app) => {
   app.use("/api/users", UserRouter);
   app.use("/api/feed", FeedRouter);
   app.use("/api/notifications", NotificationRouter);
+  app.use("/api/uploads", UploadRouter);
 
   // Health check
   app.get("/api/health", (req, res) => {

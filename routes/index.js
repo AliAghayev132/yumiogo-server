@@ -7,3 +7,4 @@ export { FavoriteRouter } from "./favoriteRoutes.js";
 export { UserRouter } from "./userRoutes.js";
 export { FeedRouter } from "./feedRoutes.js";
 export { NotificationRouter } from "./notificationRoutes.js";
+export { UploadRouter } from "./uploadRoutes.js";

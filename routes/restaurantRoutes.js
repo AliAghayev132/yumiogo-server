@@ -10,6 +10,7 @@ RestaurantRouter.get("/home", restaurantController.getHomeFeed);
 RestaurantRouter.get("/cuisines", restaurantController.getCuisines);
 RestaurantRouter.get("/search", restaurantController.searchRestaurants);
 RestaurantRouter.get("/suggest", restaurantController.suggestRestaurants);
+RestaurantRouter.get("/surprise", restaurantController.surpriseRestaurant);
 RestaurantRouter.get("/", restaurantController.listRestaurants);
 RestaurantRouter.get("/:id", restaurantController.getRestaurant);
 

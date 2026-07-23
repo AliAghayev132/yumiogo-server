@@ -1,11 +1,22 @@
+// Lib
+import { mongoose } from "#lib";
+
 // Models
 import { Restaurant } from "#models";
 
 // Constants
 import { cuisineTypes } from "#constants";
 
+// Services
+import { FileService } from "#services";
+
 // Utils
 import { asyncHandler } from "#utils";
+
+// Collect every locally-uploaded image path referenced by a restaurant doc.
+const localImagesOf = (r) =>
+  [...(r.coverImages || []), r.logo, ...(r.popularDishes || []).map((d) => d.image)]
+    .filter((p) => p && !String(p).startsWith("http"));
 
 /**
  * Build a Mongo filter + sort from query params shared by list/search.
@@ -261,6 +272,40 @@ const suggestRestaurants = asyncHandler(async (req, res) => {
 });
 
 /**
+ * Surprise me — one random open restaurant near the user, excluding already-shown ids.
+ * GET /api/restaurants/surprise?near=<lng>,<lat>&exclude=id1,id2&radius=
+ */
+const surpriseRestaurant = asyncHandler(async (req, res) => {
+  const filter = { status: "active", isDeleted: false, openNow: true };
+
+  // Aggregation pipelines don't auto-cast strings to ObjectIds — cast explicitly.
+  const exclude = String(req.query.exclude || "")
+    .split(",")
+    .filter((id) => id.match(/^[0-9a-fA-F]{24}$/))
+    .map((id) => new mongoose.Types.ObjectId(id));
+  if (exclude.length) filter._id = { $nin: exclude };
+
+  if (req.query.near) {
+    const [lng, lat] = String(req.query.near).split(",").map(Number);
+    if (!Number.isNaN(lng) && !Number.isNaN(lat)) {
+      const radius = Math.min(parseInt(req.query.radius, 10) || 20000, 50000);
+      filter.location = {
+        $geoWithin: {
+          $centerSphere: [[lng, lat], radius / 6378137], // meters → radians
+        },
+      };
+    }
+  }
+
+  const [pick] = await Restaurant.aggregate([{ $match: filter }, { $sample: { size: 1 } }]);
+
+  if (!pick) {
+    return res.json({ success: true, data: { restaurant: null } });
+  }
+  res.json({ success: true, data: { restaurant: pick } });
+});
+
+/**
  * Get a single restaurant by id or slug; increments its view counter.
  * GET /api/restaurants/:id
  */
@@ -343,11 +388,17 @@ const updateRestaurant = asyncHandler(async (req, res) => {
       .json({ success: false, message: "Restaurant not found" });
   }
 
+  const imagesBefore = localImagesOf(restaurant);
+
   EDITABLE_FIELDS.forEach((key) => {
     if (req.body[key] !== undefined) restaurant[key] = req.body[key];
   });
 
   await restaurant.save();
+
+  // Remove locally-uploaded images that are no longer referenced.
+  const imagesAfter = new Set(localImagesOf(restaurant));
+  imagesBefore.filter((p) => !imagesAfter.has(p)).forEach((p) => FileService.deleteFile(p));
 
   res.json({ success: true, message: "Restaurant updated", data: { restaurant } });
 });
@@ -378,6 +429,7 @@ export {
   listRestaurants,
   searchRestaurants,
   suggestRestaurants,
+  surpriseRestaurant,
   getHomeFeed,
   getCuisines,
   getRestaurant,

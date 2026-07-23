@@ -1,5 +1,6 @@
 import { Review, Restaurant } from "#models";
 import { SENTIMENT_SCORE } from "#models/review.model.js";
+import { FileService } from "#services";
 import { asyncHandler } from "#utils";
 
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -92,7 +93,14 @@ const createReview = asyncHandler(async (req, res) => {
     const oldScore = review.score;
     review.sentiment = sentiment;
     if (comment !== undefined) review.comment = comment;
-    if (photos !== undefined) review.photos = photos;
+    if (photos !== undefined) {
+      // Clean up locally-uploaded photos that were removed.
+      const keep = new Set(photos);
+      (review.photos || [])
+        .filter((p) => p && !p.startsWith("http") && !keep.has(p))
+        .forEach((p) => FileService.deleteFile(p));
+      review.photos = photos;
+    }
     await review.save();
     await applyRatingChange(restaurant, { addScore: newScore, removeScore: oldScore, countDelta: 0 });
   } else {
