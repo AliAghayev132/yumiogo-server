@@ -166,6 +166,81 @@ const getUserLists = asyncHandler(async (req, res) => {
   res.json({ success: true, data: { lists: shaped } });
 });
 
+/**
+ * My app settings + food preferences.
+ * GET /api/users/me/settings
+ */
+const getSettings = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id).select("settings preferences");
+  res.json({
+    success: true,
+    data: { settings: user?.settings || {}, preferences: user?.preferences || {} },
+  });
+});
+
+/**
+ * Update my app settings and/or food preferences.
+ * PUT /api/users/me/settings  { settings?: {...}, preferences?: {...} }
+ */
+const updateSettings = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+  const { settings, preferences } = req.body;
+
+  if (settings && typeof settings === "object") {
+    const allowed = [
+      "emailNotifications",
+      "pushNotifications",
+      "followerAlerts",
+      "reviewsVisibility",
+      "listsVisibility",
+    ];
+    allowed.forEach((key) => {
+      if (settings[key] !== undefined) user.settings[key] = settings[key];
+    });
+  }
+
+  if (preferences && typeof preferences === "object") {
+    if (Array.isArray(preferences.cuisines)) user.preferences.cuisines = preferences.cuisines;
+    if (Array.isArray(preferences.dietary)) user.preferences.dietary = preferences.dietary;
+  }
+
+  await user.save();
+  res.json({
+    success: true,
+    message: "Settings saved",
+    data: { settings: user.settings, preferences: user.preferences },
+  });
+});
+
+/**
+ * Delete my own account (soft delete + invalidate sessions).
+ * DELETE /api/users/me
+ */
+const deleteMyAccount = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) return res.status(404).json({ success: false, message: "User not found" });
+  if (user.role === "admin") {
+    return res
+      .status(400)
+      .json({ success: false, message: "Admin accounts must be removed from the admin panel" });
+  }
+
+  user.isDeleted = true;
+  user.tokenVersion += 1; // log out everywhere
+  await user.save();
+
+  // Hide the user's content from the app.
+  await Promise.all([
+    Review.updateMany({ user: user._id }, { $set: { isDeleted: true } }),
+    FavoriteList.updateMany({ owner: user._id }, { $set: { isDeleted: true } }),
+    User.updateMany({ following: user._id }, { $pull: { following: user._id } }),
+  ]);
+
+  res.json({ success: true, message: "Account deleted" });
+});
+
 export {
   getProfile,
   followUser,
@@ -175,4 +250,7 @@ export {
   getSuggested,
   getUserReviews,
   getUserLists,
+  getSettings,
+  updateSettings,
+  deleteMyAccount,
 };

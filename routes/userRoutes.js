@@ -9,6 +9,9 @@ UserRouter.use(authenticate);
 
 // Specific paths before "/:id".
 UserRouter.get("/suggested", userController.getSuggested);
+UserRouter.get("/me/settings", userController.getSettings);
+UserRouter.put("/me/settings", writeRateLimiter, userController.updateSettings);
+UserRouter.delete("/me", writeRateLimiter, userController.deleteMyAccount);
 
 UserRouter.get("/:id", userController.getProfile);
 UserRouter.get("/:id/followers", userController.getFollowers);

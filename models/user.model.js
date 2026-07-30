@@ -67,6 +67,24 @@ const userSchema = new Schema(
       dietary: { type: [String], default: [] },
     },
 
+    // Per-user app settings (notifications + activity visibility).
+    settings: {
+      emailNotifications: { type: Boolean, default: true },
+      pushNotifications: { type: Boolean, default: true },
+      followerAlerts: { type: Boolean, default: true },
+      // who can see my reviews / my favourite lists
+      reviewsVisibility: {
+        type: String,
+        enum: ["everyone", "followers", "me"],
+        default: "everyone",
+      },
+      listsVisibility: {
+        type: String,
+        enum: ["everyone", "followers", "me"],
+        default: "everyone",
+      },
+    },
+
     // Token version for "logout all devices"
     tokenVersion: {
       type: Number,

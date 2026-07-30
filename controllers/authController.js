@@ -516,6 +516,26 @@ const updateAvatar = asyncHandler(async (req, res) => {
   });
 });
 
+
+/**
+ * Remove the current user's avatar.
+ * DELETE /api/auth/avatar
+ */
+const deleteAvatar = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) {
+    return res.status(404).json({ success: false, message: "User not found" });
+  }
+
+  if (user.avatar) {
+    FileService.deleteFile(user.avatar);
+    user.avatar = null;
+    await user.save();
+  }
+
+  res.json({ success: true, message: "Avatar removed", data: { avatar: null } });
+});
+
 export {
   register,
   verifyOTP,
@@ -530,4 +550,5 @@ export {
   resetPassword,
   updateProfile,
   updateAvatar,
+  deleteAvatar,
 };

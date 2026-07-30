@@ -37,5 +37,6 @@ AuthRouter.put(
 );
 AuthRouter.put("/profile", authenticate, authController.updateProfile);
 AuthRouter.put("/avatar", authenticate, authController.updateAvatar);
+AuthRouter.delete("/avatar", authenticate, authController.deleteAvatar);
 
 export { AuthRouter };
