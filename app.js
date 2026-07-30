@@ -1,5 +1,5 @@
 // ============ EXTERNAL PACKAGES ============
-import { http, cors, helmet, express, fileUpload, compression } from "#lib";
+import { http, cors, helmet, express, fileUpload, compression, fs, path } from "#lib";
 
 // ============ INTERNAL IMPORTS ============
 import { config, corsConfig, securityConfig } from "#config";
@@ -130,6 +130,31 @@ const setupRoutes = (app) => {
   });
 };
 
+
+/**
+ * Serve the built client (admin-web/dist) when present, so a single proxy port
+ * (nginx -> localhost:PORT) serves the site, the API and uploaded files.
+ * Non-API routes fall through to index.html for client-side routing.
+ */
+const setupClient = (app) => {
+  const clientDir = path.resolve(process.env.CLIENT_DIST || "../admin-web/dist");
+  const indexFile = path.join(clientDir, "index.html");
+
+  if (!fs.existsSync(indexFile)) {
+    console.log(`ℹ️  Client build not found at ${clientDir} — serving API only`);
+    return;
+  }
+
+  app.use(express.static(clientDir, { maxAge: "1h", index: false }));
+
+  // SPA fallback for anything that is not an API or upload request.
+  app.get(/^\/(?!api|uploads).*/, (req, res) => {
+    res.sendFile(indexFile);
+  });
+
+  console.log(`✅ Serving client from ${clientDir}`);
+};
+
 /**
  * Configure error handlers
  */
@@ -186,24 +211,30 @@ const validateEnv = () => {
   const isProduction = process.env.NODE_ENV === "production";
   if (!isProduction) return;
 
+  // Must match the fallbacks in config/config.js.
   const defaults = {
-    ACCESS_SECRET_KEY: "starter_access_secret_key",
-    REFRESH_SECRET_KEY: "starter_refresh_secret_key",
-    ENCRYPTION_KEY: "starter_32_char_encryption_key!!",
+    ACCESS_SECRET_KEY: "yumio_dev_access_secret_key_change_me",
+    REFRESH_SECRET_KEY: "yumio_dev_refresh_secret_key_change_me",
+    ENCRYPTION_KEY: "yumio_dev_32_char_encryption_key",
   };
 
-  for (const [key, defaultVal] of Object.entries(defaults)) {
-    if (!process.env[key] || process.env[key] === defaultVal) {
-      console.error(
-        `❌ CRITICAL: ${key} is using a default value in production! Set a strong random key.`,
-      );
-      process.exit(1);
-    }
-  }
+  const missing = Object.entries(defaults)
+    .filter(([key, defaultVal]) => !process.env[key] || process.env[key] === defaultVal)
+    .map(([key]) => key);
 
-  if (!process.env.MONGODB_URI) {
+  if (!process.env.MONGODB_URI) missing.push("MONGODB_URI");
+
+  if (missing.length) {
     console.error(
-      "❌ CRITICAL: MONGODB_URI is not configured for production!",
+      [
+        "",
+        "❌ Missing production configuration — refusing to start.",
+        `   Set these in server/.env: ${missing.join(", ")}`,
+        "",
+        "   Generate secrets with:  openssl rand -hex 32",
+        "   Example MONGODB_URI:    mongodb://127.0.0.1:27017/yumio",
+        "",
+      ].join("\n"),
     );
     process.exit(1);
   }
@@ -258,6 +289,7 @@ const startApp = async () => {
     setupSecurity(app);
     setupMiddlewares(app);
     setupRoutes(app);
+    setupClient(app);
     setupErrorHandlers(app);
 
     await initializeServices();

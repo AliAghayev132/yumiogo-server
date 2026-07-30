@@ -8,14 +8,19 @@ dotenv.config({ path: `.env.${NODE_ENV}` });
 dotenv.config();
 
 const isProduction = NODE_ENV === "production";
-const domain = process.env.DOMAIN || "localhost";
+
+// Production runs behind nginx on PROXY_PORT for https://yumiogo.com.
+const domain = process.env.DOMAIN || (isProduction ? "yumiogo.com" : "localhost");
+
+// Single proxy port: nginx forwards yumiogo.com -> localhost:3042.
+const port = Number(process.env.PORT) || 3042;
 
 const config = {
   development: {
-    port: process.env.PORT || 5000,
+    port,
     db: {
       host: process.env.DB_HOST || "localhost",
-      name: process.env.DB_NAME || "starter",
+      name: process.env.DB_NAME || "yumio",
       username: process.env.DB_USERNAME || "",
       password: process.env.DB_PASSWORD || "",
       clusterName: process.env.DB_CLUSTER_NAME || "",
@@ -23,27 +28,28 @@ const config = {
   },
 
   // Site
-  siteName: "Starter",
+  siteName: "Yumio",
   domain,
-  appUrl: process.env.APP_URL || "http://localhost:5000",
+  appUrl:
+    process.env.APP_URL || (isProduction ? `https://${domain}` : `http://localhost:${port}`),
   clientUrl:
     process.env.CLIENT_URL ||
     (isProduction ? `https://${domain}` : "http://localhost:5173"),
 
   // Auth secrets (override in production via env)
-  accessSecretKey: process.env.ACCESS_SECRET_KEY || "starter_access_secret_key",
-  refreshSecretKey: process.env.REFRESH_SECRET_KEY || "starter_refresh_secret_key",
-  encryptionKey: process.env.ENCRYPTION_KEY || "starter_32_char_encryption_key!!",
+  accessSecretKey: process.env.ACCESS_SECRET_KEY || "yumio_dev_access_secret_key_change_me",
+  refreshSecretKey: process.env.REFRESH_SECRET_KEY || "yumio_dev_refresh_secret_key_change_me",
+  encryptionKey: process.env.ENCRYPTION_KEY || "yumio_dev_32_char_encryption_key",
 
   // Default admin (created on first boot by BootstrapService)
   defaultAdmin: {
-    email: process.env.DEFAULT_ADMIN_EMAIL || "admin@example.com",
+    email: process.env.DEFAULT_ADMIN_EMAIL || "admin@yumio.app",
     password: process.env.DEFAULT_ADMIN_PASSWORD || "Admin123!",
   },
 
   // Cookie names (prefixed to avoid collisions)
-  accessCookieName: "__starter_at",
-  refreshCookieName: "__starter_rt",
+  accessCookieName: "__yumio_at",
+  refreshCookieName: "__yumio_rt",
 
   // Cookie options
   cookie: {
@@ -77,13 +83,16 @@ const corsConfig = {
   origin: isProduction
     ? [
         process.env.CLIENT_URL,
-        `https://www.${domain}`,
         `https://${domain}`,
+        `https://www.${domain}`,
+        `http://${domain}`,
+        `http://www.${domain}`,
       ].filter(Boolean)
     : [
         "http://localhost:5173",
         "http://localhost:3000",
         "http://127.0.0.1:5173",
+        `http://localhost:${port}`,
       ],
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
   allowedHeaders: ["Authorization", "Content-Type"],
