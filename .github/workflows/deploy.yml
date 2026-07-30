@@ -1,0 +1,174 @@
+name: Deploy Yumio Backend
+
+on:
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: deploy-yumio-server
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SECRET_KEY }}
+          port: 2222
+          command_timeout: 8m
+          script: |
+            #!/bin/bash
+            set -euo pipefail
+
+            # ========================================
+            # 1. NVM mühitini yüklə
+            # ========================================
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" || {
+              echo "❌ nvm.sh tapılmadı: $NVM_DIR/nvm.sh"
+              exit 1
+            }
+
+            # ========================================
+            # 2. Node 20 versiyasını aktiv et
+            #    (Mongoose 9 / Express 5 minimum Node 20 tələb edir)
+            # ========================================
+            echo "🔄 Node 20 aktivləşdirilir..."
+            nvm use 20 || {
+              echo "⚠️ Node 20 tapılmadı, default Node istifadə olunur"
+              nvm use default
+            }
+
+            # ========================================
+            # 3. PM2 PATH-ı (nvm-in aktiv Node-u ilə gəlir)
+            # ========================================
+            export PATH="$NVM_BIN:$PATH"
+
+            # ========================================
+            # 4. Versiyaları yoxla (npm + package-lock.json)
+            # ========================================
+            echo "🔎 Quraşdırılmış versiyalar:"
+            node -v || { echo "❌ node tapılmadı"; exit 1; }
+            npm -v  || { echo "❌ npm tapılmadı"; exit 1; }
+            pm2 -v  || { echo "❌ pm2 tapılmadı (npm i -g pm2)"; exit 1; }
+
+            # ========================================
+            # 5. Proyekt konfiqurasiyası
+            # ========================================
+            APP_NAME="yumio"
+            CWD="/var/www/yumio/server"
+            ENTRY="app.js"
+            PORT_NUM=3042
+            export NODE_ENV=production
+
+            echo "➡️ Proyekt qovluğuna keçilir: $CWD"
+            cd "$CWD" || { echo "❌ Qovluq tapılmadı: $CWD"; exit 1; }
+
+            # ========================================
+            # 6. .env mövcuddurmu? (production-da məcburidir)
+            #    Server ACCESS/REFRESH/ENCRYPTION açarları və MONGODB_URI
+            #    olmadan qəsdən start etmir.
+            # ========================================
+            if [ ! -f ".env" ]; then
+              echo "❌ .env tapılmadı: $CWD/.env"
+              echo "   Lazımdır: MONGODB_URI, ACCESS_SECRET_KEY, REFRESH_SECRET_KEY, ENCRYPTION_KEY"
+              echo "   Açar yaratmaq üçün: openssl rand -hex 32"
+              exit 1
+            fi
+
+            # ========================================
+            # 7. Git repository-ni yenilə
+            # ========================================
+            echo "📥 Repository yenilənir..."
+            PREV_COMMIT=$(git rev-parse --short HEAD)
+            git fetch origin main --prune
+
+            if ! git merge --ff-only origin/main; then
+              echo "⚠️ Fast-forward merge mümkün olmadı, hard reset edilir..."
+              git reset --hard origin/main
+            fi
+
+            NEW_COMMIT=$(git rev-parse --short HEAD)
+            echo "✅ Repository yeniləndi: $PREV_COMMIT → $NEW_COMMIT"
+
+            # ========================================
+            # 8. Dependencies quraşdır (yalnız runtime paketləri)
+            #    --legacy-peer-deps: eslint 10 ilə eslint-plugin-import
+            #    arasındakı peer konflikti üçün
+            # ========================================
+            echo "📦 Dependencies quraşdırılır..."
+            npm ci --omit=dev --legacy-peer-deps --no-audit --no-fund
+
+            # ========================================
+            # 9. PM2 ilə başlat/yenidən başlat
+            # ========================================
+            echo "🚀 PM2 ilə aplikasiya başladılır..."
+
+            if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+              echo "🔄 Mövcud aplikasiya yenidən başladılır..."
+              pm2 restart "$APP_NAME" --update-env
+            else
+              echo "🆕 Yeni aplikasiya başladılır..."
+              pm2 start "$ENTRY" \
+                --name "$APP_NAME" \
+                --time \
+                --update-env \
+                --cwd "$CWD" \
+                --node-args="--max-old-space-size=512"
+            fi
+
+            pm2 save --force
+
+            # ========================================
+            # 10. Health check — həm PM2 statusu, həm real HTTP cavabı
+            # ========================================
+            echo "🏥 Health check edilir..."
+            sleep 3
+
+            if ! pm2 describe "$APP_NAME" | grep -q "online"; then
+              echo "❌ Aplikasiya başlaya bilmədi!"
+              pm2 logs "$APP_NAME" --lines 30 --nostream || true
+              exit 1
+            fi
+            echo "✅ PM2: online"
+
+            HEALTH_OK=0
+            for i in 1 2 3 4 5; do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PORT_NUM/api/health" || echo "000")
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "✅ /api/health cavab verdi (HTTP 200)"
+                HEALTH_OK=1
+                break
+              fi
+              echo "   ...gözlənilir (cəhd $i, HTTP $HTTP_CODE)"
+              sleep 2
+            done
+
+            if [ "$HEALTH_OK" != "1" ]; then
+              echo "❌ Health check uğursuz — son loglar:"
+              pm2 logs "$APP_NAME" --lines 30 --nostream || true
+              exit 1
+            fi
+
+            # Client build-i verilirmi? (server dist/-i özü serve edir)
+            SITE_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PORT_NUM/" || echo "000")
+            if [ "$SITE_CODE" = "200" ]; then
+              echo "✅ Sayt (client build) verilir"
+            else
+              echo "⚠️ Sayt HTTP $SITE_CODE — client hələ deploy olunmayıb? (/var/www/yumio/client/dist)"
+            fi
+
+            # ========================================
+            # 11. Uğurlu nəticə
+            # ========================================
+            echo ""
+            echo "✅ Deploy uğurla tamamlandı!"
+            echo "📦 Aplikasiya: $APP_NAME (port $PORT_NUM)"
+            echo "📊 Versiya: $PREV_COMMIT → $NEW_COMMIT"
+            echo "🕒 Tarix: $(date '+%Y-%m-%d %H:%M:%S')"

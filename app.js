@@ -132,27 +132,49 @@ const setupRoutes = (app) => {
 
 
 /**
- * Serve the built client (admin-web/dist) when present, so a single proxy port
- * (nginx -> localhost:PORT) serves the site, the API and uploaded files.
- * Non-API routes fall through to index.html for client-side routing.
+ * Serve the built client when present, so a single proxy port (nginx ->
+ * localhost:PORT) serves the site, the API and uploaded files.
+ *
+ * The build directory is resolved from CLIENT_DIST, otherwise from the layouts
+ * we ship with: the monorepo (../admin-web/dist) and a VPS checkout where the
+ * client repo sits next to the server one (../client/dist).
+ *
+ * Existence is re-checked per request, so deploying the client after the server
+ * has started (or in either order) takes effect without a restart.
  */
-const setupClient = (app) => {
-  const clientDir = path.resolve(process.env.CLIENT_DIST || "../admin-web/dist");
-  const indexFile = path.join(clientDir, "index.html");
+const CLIENT_DIST_CANDIDATES = [
+  process.env.CLIENT_DIST,
+  "../admin-web/dist",
+  "../client/dist",
+].filter(Boolean);
 
-  if (!fs.existsSync(indexFile)) {
-    console.log(`ℹ️  Client build not found at ${clientDir} — serving API only`);
-    return;
+const resolveClientIndex = () => {
+  for (const dir of CLIENT_DIST_CANDIDATES) {
+    const indexFile = path.resolve(dir, "index.html");
+    if (fs.existsSync(indexFile)) return { dir: path.resolve(dir), indexFile };
   }
+  return null;
+};
 
-  app.use(express.static(clientDir, { maxAge: "1h", index: false }));
-
-  // SPA fallback for anything that is not an API or upload request.
-  app.get(/^\/(?!api|uploads).*/, (req, res) => {
-    res.sendFile(indexFile);
+const setupClient = (app) => {
+  // Static assets: express.static simply falls through when a path is missing.
+  CLIENT_DIST_CANDIDATES.forEach((dir) => {
+    app.use(express.static(path.resolve(dir), { maxAge: "1h", index: false }));
   });
 
-  console.log(`✅ Serving client from ${clientDir}`);
+  // SPA fallback for anything that is not an API or upload request.
+  app.get(/^\/(?!api|uploads).*/, (req, res, next) => {
+    const client = resolveClientIndex();
+    if (!client) return next(); // no build yet -> 404 handler
+    return res.sendFile(client.indexFile);
+  });
+
+  const found = resolveClientIndex();
+  console.log(
+    found
+      ? `✅ Serving client from ${found.dir}`
+      : `ℹ️  No client build found (looked in: ${CLIENT_DIST_CANDIDATES.join(", ")}) — serving API only`,
+  );
 };
 
 /**

@@ -12,8 +12,8 @@ The whole product runs behind **one proxy port: `3042`**.
                     └─────────────────────────────────────────┘
 ```
 
-The Express server serves the API, the uploaded files **and** the built client
-(`admin-web/dist`), so nginx only needs a single `proxy_pass`.
+The Express server serves the API, the uploaded files **and** the built client,
+so nginx only needs a single `proxy_pass`.
 
 ---
 
@@ -24,7 +24,7 @@ The Express server serves the API, the uploaded files **and** the built client
 | Port | `3042` |
 | Domain | `yumiogo.com` in production, `localhost` in development |
 | Database | `mongodb://localhost:27017/yumio` |
-| Client build path | `../admin-web/dist` (override with `CLIENT_DIST`) |
+| Client build path | `../admin-web/dist` or `../client/dist` (override with `CLIENT_DIST`) |
 | Default admin | `admin@yumio.app` / `Admin123!` |
 
 **Production still requires** three secrets and a Mongo URI — the server refuses
@@ -145,9 +145,73 @@ To point a build at a different backend:
 EXPO_PUBLIC_API_URL=https://staging.yumiogo.com/api npx expo start
 ```
 
+
 ---
 
-## 5. Post-deploy checks
+## 5. CI/CD (GitHub Actions)
+
+Hər repoda `.github/workflows/deploy.yml` var — `main`-ə push olunanda VPS-ə
+SSH ilə girib deploy edir.
+
+### VPS qovluq quruluşu
+
+```
+/var/www/yumio/
+├── server/     ← yumiogo-server repo (pm2 "yumio", port 3042)
+└── client/     ← yumiogo-client repo (build → client/dist)
+```
+
+Server `client/dist`-i avtomatik tapır (`../client/dist`), ona görə **client
+deploy-dan sonra serveri restart etmək lazım deyil**.
+
+### GitHub Secrets (hər iki repoda eyni)
+
+| Secret | Nə |
+|---|---|
+| `HOST` | VPS IP və ya host adı |
+| `USERNAME` | SSH istifadəçisi |
+| `SECRET_KEY` | SSH private key (tam məzmun) |
+
+SSH portu workflow-da `2222` kimi yazılıb.
+
+### İlk quraşdırma (bir dəfəlik)
+
+```bash
+sudo mkdir -p /var/www/yumio && cd /var/www/yumio
+git clone https://github.com/AliAghayev132/yumiogo-server.git server
+git clone https://github.com/AliAghayev132/yumiogo-client.git client
+
+# server .env (yuxarıdakı 1-ci bölmə)
+cd server && cp .env.example .env && nano .env
+
+# ilk build + start
+cd ../client && npm ci --legacy-peer-deps && npm run build
+cd ../server && npm ci --omit=dev --legacy-peer-deps
+pm2 start app.js --name yumio --time --cwd /var/www/yumio/server
+pm2 save && pm2 startup
+```
+
+### Deploy ardıcıllığı
+
+İkisi paralel qaça bilər — asılılıq yoxdur:
+- **client** push → `npm ci` → `npm run build` → `dist/` yenilənir (restart yox)
+- **server** push → `npm ci --omit=dev` → `pm2 restart yumio` → health check
+
+Hər iki workflow uğursuz olanda dayanır: client köhnə `dist`-i geri qaytarır
+(rollback), server isə pm2 loglarını çap edib `exit 1` verir.
+
+### Qeydlər
+
+- Client **`VITE_API_URL` təyin etmir** — production bundle öz origin-inə
+  (`/api`) müraciət edir.
+- Client-də `npm ci` `NODE_ENV=development` ilə çağırılır, çünki Vite və build
+  alətləri `devDependencies`-dədir (`NODE_ENV=production` onları atlayır).
+- Server `--omit=dev` ilə qurulur; `devDependencies` yalnız eslint/prettier/nodemon-dur.
+- `--legacy-peer-deps` eslint 10 ↔ eslint-plugin-import peer konflikti üçün lazımdır.
+
+---
+
+## 6. Post-deploy checks
 
 ```bash
 curl -I  https://yumiogo.com/                 # 200, HTML (landing)
