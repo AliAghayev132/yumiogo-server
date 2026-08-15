@@ -3,19 +3,32 @@ import { asyncHandler } from "#utils";
 
 const DEFAULT_LIST_NAME = "Saved";
 
+/**
+ * Stringify a user reference regardless of whether it was populated.
+ *
+ * `getList` populates `owner` and `collaborators.user`, which turns them from
+ * ObjectIds into documents. Calling `.toString()` on a populated document
+ * yields its inspect output, not the id, so a plain `ref.toString() === userId`
+ * comparison silently fails and locks the owner out of their own list.
+ */
+const idOf = (ref) => {
+  if (!ref) return "";
+  return (ref._id ?? ref).toString();
+};
+
 // Access check: can this user view the list?
 const canView = (list, userId) => {
   if (list.privacy === "public") return true;
-  if (list.owner.toString() === userId) return true;
-  return list.collaborators.some((c) => c.user.toString() === userId);
+  if (idOf(list.owner) === userId) return true;
+  return list.collaborators.some((c) => idOf(c.user) === userId);
 };
 
 // Can this user edit (add/remove items)?
 const canEdit = (list, userId) => {
-  if (list.owner.toString() === userId) return true;
+  if (idOf(list.owner) === userId) return true;
   if (list.privacy !== "collaborative") return false;
   return list.collaborators.some(
-    (c) => c.user.toString() === userId && c.role === "editor",
+    (c) => idOf(c.user) === userId && c.role === "editor",
   );
 };
 
