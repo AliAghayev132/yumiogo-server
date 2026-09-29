@@ -1,25 +1,28 @@
-import { baseTemplate } from "./baseTemplate.js";
+import { emailCopy } from "#i18n/index.js";
+import { baseTemplate, brand, escapeHtml } from "./baseTemplate.js";
 
 /**
- * Welcome email template (example of a domain-specific email)
+ * Welcome email template (sent after registration), in `lang` (en | az | ru).
  */
-export const welcomeTemplate = (firstName, clientUrl) => {
+export const welcomeTemplate = (firstName, clientUrl, lang = "en") => {
+  const copy = emailCopy(lang);
+  const heading = copy.welcomeHeading.replace("{name}", firstName ? `, ${escapeHtml(firstName)}` : "");
   const content = `
-    <h2 style="margin: 0 0 16px; color: #2E3031; font-size: 22px;">
-      Welcome${firstName ? `, ${firstName}` : ""}! 🎉
+    <h2 style="margin: 0 0 16px; color: ${brand.text}; font-size: 22px;">
+      ${heading}
     </h2>
-    <p style="margin: 0 0 30px; color: #666666; font-size: 16px; line-height: 1.5;">
-      Your account has been created successfully. We're glad to have you on board.
+    <p style="margin: 0 0 28px; color: ${brand.muted}; font-size: 16px; line-height: 1.5;">
+      ${escapeHtml(copy.welcomeBody)}
     </p>
 
-    <a href="${clientUrl}" style="display: inline-block; background-color: #4f46e5; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px; font-weight: 600;">
-      Get Started
+    <a href="${escapeHtml(clientUrl)}" style="display: inline-block; background-color: ${brand.orange}; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 16px; font-weight: 600;">
+      ${escapeHtml(copy.welcomeCta)}
     </a>
 
-    <p style="margin: 30px 0 0; color: #999999; font-size: 13px;">
-      If you have any questions, just reply to this email.
+    <p style="margin: 28px 0 0; color: ${brand.subtle}; font-size: 13px;">
+      ${escapeHtml(copy.welcomeFooter)}
     </p>
   `;
 
-  return baseTemplate("Welcome", content);
+  return baseTemplate(copy.welcomeTitle, content);
 };

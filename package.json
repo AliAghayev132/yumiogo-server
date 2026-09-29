@@ -8,7 +8,9 @@
     "start": "node app.js",
     "seed": "node scripts/seed.js",
     "db:reset": "node scripts/resetDatabase.js",
+    "db:reset:demo": "node scripts/resetDatabase.js --demo-only",
     "lint": "eslint .",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
     "format": "prettier --write ."
   },
   "dependencies": {
@@ -19,6 +21,7 @@
     "express": "^5.2.1",
     "express-fileupload": "^1.5.2",
     "express-rate-limit": "^8.5.2",
+    "google-auth-library": "^11.1.0",
     "helmet": "^8.2.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.7.3",

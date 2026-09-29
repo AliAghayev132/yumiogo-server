@@ -1,18 +1,23 @@
 import { nodemailer } from "#lib";
 import { config } from "#config";
-import { otpTemplate, welcomeTemplate } from "#templates";
+import { otpTemplate, welcomeTemplate, newFollowerTemplate } from "#templates";
+import { emailCopy, fill } from "#i18n/index.js";
 
 /**
  * MailService (static)
- * Thin wrapper over nodemailer with a couple of ready-made emails
- * (OTP verification + welcome). Extend with your own senders.
+ * Thin wrapper over nodemailer with the app's ready-made emails
+ * (OTP verification, welcome, new follower).
+ *
+ * Every sender resolves to { success, notConfigured?, error? } and never
+ * throws, so callers can answer 503 when mail is unavailable. Subjects and
+ * bodies are sent in `lang` (en | az | ru — i18n/messages.js EMAIL_COPY).
  */
 class MailService {
   static transporter = null;
 
   /**
    * Initialize the SMTP transporter (call once at startup).
-   * If SMTP is not configured, sends become no-ops with a warning.
+   * If SMTP is not configured, sends fail with { notConfigured: true }.
    */
   static init() {
     if (config.smtp.user && config.smtp.pass) {
@@ -25,7 +30,14 @@ class MailService {
           pass: config.smtp.pass,
         },
       });
+    } else if (process.env.NODE_ENV === "production") {
+      console.warn("⚠️  SMTP_USER/SMTP_PASS missing — sign-up and password reset e-mails are disabled (503)");
     }
+  }
+
+  /** True when e-mails can actually be delivered. */
+  static isConfigured() {
+    return !!this.transporter;
   }
 
   /**
@@ -35,7 +47,7 @@ class MailService {
   static async send({ to, subject, html }) {
     if (!this.transporter) {
       console.warn("Mail service not configured (SMTP_USER/SMTP_PASS missing)");
-      return { success: false, error: "Mail service not configured" };
+      return { success: false, notConfigured: true, error: "Mail service not configured" };
     }
 
     try {
@@ -47,15 +59,20 @@ class MailService {
       });
       return { success: true };
     } catch (error) {
-      console.error("Mail send error:", error);
+      console.error("Mail send error:", error.message);
       return { success: false, error: error.message };
     }
   }
 
   /**
    * Send an OTP verification code
+   * @param {string} email
+   * @param {string} code
+   * @param {string} type - register | reset-password | verify-email
+   * @param {number} minutes - code validity shown in the mail
+   * @param {string} lang - en | az | ru
    */
-  static async sendOTP(email, code, type = "register") {
+  static async sendOTP(email, code, type = "register", minutes = Math.round(config.otpExpiresIn / 60), lang = "en") {
     // Dev convenience: with no SMTP configured, print the code to the server
     // console instead of failing, so the auth flow is testable locally.
     if (!this.transporter && process.env.NODE_ENV !== "production") {
@@ -65,33 +82,38 @@ class MailService {
       return { success: true, dev: true };
     }
 
-    const titles = {
-      register: "Registration Verification",
-      "reset-password": "Password Reset",
-      "verify-email": "Email Verification",
-    };
-
-    const messages = {
-      register: "Enter the code below to complete your registration:",
-      "reset-password": "Enter the code below to reset your password:",
-      "verify-email": "Enter the code below to verify your email address:",
-    };
+    const copy = emailCopy(lang);
+    const title = copy.otpTitle[type] || copy.otpTitle.register;
+    const message = copy.otpMessage[type] || copy.otpMessage.register;
 
     return this.send({
       to: email,
-      subject: `${titles[type]} - ${config.siteName}`,
-      html: otpTemplate(titles[type], messages[type], code),
+      subject: `${title} - ${config.siteName}`,
+      html: otpTemplate(title, message, code, minutes, lang),
     });
   }
 
   /**
-   * Send a welcome email (example of a domain-specific mail)
+   * Send a welcome email
    */
-  static async sendWelcome(email, firstName) {
+  static async sendWelcome(email, firstName, lang = "en") {
+    if (!this.transporter) return { success: false, notConfigured: true };
     return this.send({
       to: email,
-      subject: `Welcome to ${config.siteName}!`,
-      html: welcomeTemplate(firstName, config.clientUrl),
+      subject: fill(emailCopy(lang).welcomeSubject, { app: config.siteName }),
+      html: welcomeTemplate(firstName, config.appUrl, lang),
+    });
+  }
+
+  /**
+   * "<actor> started following you" email (recipient's emailNotifications toggle).
+   */
+  static async sendNewFollower(email, firstName, actorName, lang = "en") {
+    if (!this.transporter) return { success: false, notConfigured: true };
+    return this.send({
+      to: email,
+      subject: fill(emailCopy(lang).followerSubject, { actor: actorName, app: config.siteName }),
+      html: newFollowerTemplate(firstName, actorName, config.appUrl, lang),
     });
   }
 }

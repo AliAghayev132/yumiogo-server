@@ -14,6 +14,7 @@ const authenticate = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "Authentication required",
+        code: "AUTH_REQUIRED",
       });
     }
 
@@ -26,6 +27,7 @@ const authenticate = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "Account not found or inactive",
+        code: "ACCOUNT_INACTIVE",
       });
     }
 
@@ -34,6 +36,7 @@ const authenticate = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "Session expired, please login again",
+        code: "SESSION_EXPIRED",
       });
     }
 
@@ -50,6 +53,7 @@ const authenticate = async (req, res, next) => {
     return res.status(401).json({
       success: false,
       message: "Invalid token",
+      code: "TOKEN_INVALID",
     });
   }
 };
@@ -65,6 +69,7 @@ const authenticateRefreshToken = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "Refresh token required",
+        code: "REFRESH_TOKEN_REQUIRED",
       });
     }
 
@@ -73,10 +78,11 @@ const authenticateRefreshToken = async (req, res, next) => {
 
     const user = await User.findById(decoded.id).select("-password");
 
-    if (!user || user.isDeleted) {
+    if (!user || user.isDeleted || user.status !== "active") {
       return res.status(401).json({
         success: false,
-        message: "Account not found",
+        message: "Account not found or inactive",
+        code: "ACCOUNT_INACTIVE",
       });
     }
 
@@ -84,15 +90,19 @@ const authenticateRefreshToken = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "Session expired",
+        code: "SESSION_EXPIRED",
       });
     }
 
     req.user = user;
+    // The controller rotates it (AuthTokenService.rotateRefreshToken).
+    req.refreshToken = { token, decoded };
     next();
   } catch (_error) {
     return res.status(401).json({
       success: false,
       message: "Invalid refresh token",
+      code: "REFRESH_TOKEN_INVALID",
     });
   }
 };
@@ -116,6 +126,7 @@ const authenticateResetToken = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "Reset token required",
+        code: "RESET_TOKEN_REQUIRED",
       });
     }
 
@@ -125,6 +136,7 @@ const authenticateResetToken = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "Invalid or expired reset token",
+        code: "RESET_TOKEN_INVALID",
       });
     }
 
@@ -134,6 +146,7 @@ const authenticateResetToken = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "Account not found",
+        code: "USER_NOT_FOUND",
       });
     }
 
@@ -144,6 +157,7 @@ const authenticateResetToken = async (req, res, next) => {
     return res.status(401).json({
       success: false,
       message: "Invalid reset token",
+      code: "RESET_TOKEN_INVALID",
     });
   }
 };
@@ -158,6 +172,7 @@ const requireRole = (allowedRoles) => {
       return res.status(401).json({
         success: false,
         message: "Authentication required",
+        code: "AUTH_REQUIRED",
       });
     }
 
@@ -165,6 +180,7 @@ const requireRole = (allowedRoles) => {
       return res.status(403).json({
         success: false,
         message: "You do not have permission for this action",
+        code: "FORBIDDEN",
       });
     }
 

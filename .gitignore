@@ -3,6 +3,14 @@ node_modules/
 .env.*
 uploads/*
 !uploads/.gitkeep
+# Figma default images (cuisine chips, Recommends tiles) ship with the code.
+!uploads/catalog/
+uploads/catalog/*
+!uploads/catalog/defaults/
+# Demo-data photos (SeedService "Load mock data") ship with the code too.
+!uploads/restaurants/
+uploads/restaurants/*
+!uploads/restaurants/seed/
 *.log
 .DS_Store
 !.env.example

@@ -1,31 +1,66 @@
-import { mongoDBService, SeedService } from "#services";
+import { mongoDBService, SeedService, PlatformService } from "#services";
 
 /**
- * Yumio unified seeder — seeds EVERYTHING in one command.
+ * Yumio demo seeder — replaces the demo data (documents tagged isSeed) with a
+ * fresh, consistent batch; real data is never touched.
  *
- *   npm run seed
+ *   npm run seed            load (or reload) the mock data
+ *   npm run seed -- --clear remove the mock data only
  *
- * The actual data + logic lives in SeedService (shared with the admin panel's
- * Seed button). This script just manages the DB connection for CLI use.
+ * The data + logic live in SeedService (shared with the admin panel's
+ * Settings → Data card). Refused in production unless ENABLE_DEMO_SEED=true.
  */
+const LABELS = {
+  restaurants: "restaurants",
+  menuCategories: "menu categories",
+  menuItems: "menu items",
+  users: "users",
+  invites: "accepted invites",
+  followEdges: "follow edges",
+  lists: "favourite lists",
+  listItems: "saved places",
+  listSaves: "list saves",
+  reviews: "reviews",
+  likes: "review likes",
+  comments: "comments",
+  replies: "of them replies",
+  shares: "shares",
+  restaurantFollows: "restaurant follows",
+  reports: "reports",
+  labelRequests: "label requests",
+  notifications: "notifications",
+  notificationTypes: "notification types",
+  views: "restaurant views",
+  searches: "search history entries",
+};
+
+const print = (counts) =>
+  Object.entries(counts).forEach(([key, value]) => console.log(`   ${String(value).padStart(5)}  ${LABELS[key] || key}`));
+
 const seed = async () => {
   try {
-    console.log("🌱 Yumio unified seed starting...\n");
+    if (!PlatformService.isDemoDataEnabled()) {
+      console.error("❌ Demo data is disabled in production (set ENABLE_DEMO_SEED=true to allow it).");
+      process.exit(1);
+    }
+    const clear = process.argv.includes("--clear");
+
     await mongoDBService.connect();
     console.log("✅ Connected to MongoDB\n");
 
-    const counts = await SeedService.seedAll();
-
-    console.log(`✅ ${counts.restaurants} restaurants`);
-    console.log(`✅ ${counts.users} users (password: Password123!)`);
-    console.log(`✅ ${counts.reviews} reviews`);
-    console.log(`✅ ${counts.lists} public favorite lists`);
-    console.log(`✅ ${counts.followEdges} follow edges`);
-    console.log(`✅ ${counts.reports} reports (5 open)`);
-
-    console.log("\n🎉 Seed complete!");
-    console.log("   Admin:  admin@yumio.app / Admin123!");
-    console.log("   User:   lala@yumio.app  / Password123!");
+    if (clear) {
+      console.log("🧹 Removing the demo data...\n");
+      print(await SeedService.clearAll());
+      console.log("\n✅ Demo data removed");
+    } else {
+      console.log("🌱 Loading the demo data...\n");
+      const started = Date.now();
+      print(await SeedService.seedAll());
+      console.log(`\n🎉 Seed complete in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+      if (PlatformService.isDevelopment()) {
+        console.log(`   Demo user: lala@yumio.app / ${SeedService.DEMO_PASSWORD}`);
+      }
+    }
 
     await mongoDBService.disconnect();
     process.exit(0);

@@ -3,13 +3,39 @@ name: Deploy Yumio Backend
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 concurrency:
-  group: deploy-yumio-server
+  group: deploy-yumio-server-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Lint + smoke test (npm test boots the app against a throwaway MongoDB).
+  # Pull requests run only this job; main deploys only after it passes.
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --legacy-peer-deps --no-audit --no-fund
+      - run: npm run lint
+      - run: npm test
+        env:
+          TEST_MONGODB_URI: mongodb://127.0.0.1:27017
+
   deploy:
+    needs: checks
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -154,6 +180,12 @@ jobs:
               echo "❌ Health check uğursuz — son loglar:"
               pm2 logs "$APP_NAME" --lines 30 --nostream || true
               exit 1
+            fi
+
+            # E-poçt (SMTP) konfiqurasiya olunubmu? Olmasa qeydiyyat / şifrə bərpası 503 qaytarır.
+            if curl -s "http://127.0.0.1:$PORT_NUM/api/health" | grep -q '"mail":"not-configured"'; then
+              echo "⚠️ SMTP konfiqurasiya olunmayıb — qeydiyyat və şifrə bərpası e-poçtları göndərilmir (503)."
+              echo "   server/.env: SMTP_USER / SMTP_PASS (REQUIRE_SMTP=true olsa server SMTP-siz başlamır)"
             fi
 
             # Client build-i verilirmi? (server dist/-i özü serve edir)

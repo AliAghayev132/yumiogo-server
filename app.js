@@ -10,6 +10,15 @@ import {
   socketService,
   mongoDBService,
   bootstrapAdmin,
+  CatalogService,
+  OpeningHoursService,
+  RestaurantStatsService,
+  PlatformService,
+  ModerationService,
+  ReviewService,
+  UploadSweepService,
+  RestaurantFollowService,
+  LinkPreviewService,
 } from "#services";
 
 // Middlewares
@@ -17,13 +26,22 @@ import {
   noCookies,
   apiRateLimiter,
   securityHeaders,
+  uploadHeaders,
   sanitizeInput,
+  maintenanceGate,
+  accountStatusGate,
+  newAccountPolicy,
+  restaurantApprovalGate,
+  notFoundHandler,
+  errorHandler,
+  localize,
+  apiVersionAlias,
+  appVersionGate,
 } from "#middlewares";
 
 // Routes
 import {
   AuthRouter,
-  PostRouter,
   RestaurantRouter,
   ReviewRouter,
   AdminRouter,
@@ -32,6 +50,13 @@ import {
   FeedRouter,
   NotificationRouter,
   UploadRouter,
+  CatalogRouter,
+  ContentRouter,
+  CommentRouter,
+  ReportRouter,
+  PlacesRouter,
+  WellKnownRouter,
+  RootAppleRouter,
 } from "#routes";
 
 // ============ APP INSTANCE ============
@@ -47,15 +72,22 @@ app.set("trust proxy", 1);
  * Configure security middlewares
  */
 const setupSecurity = (app) => {
-  // Helmet for security headers
+  const isProduction = process.env.NODE_ENV === "production";
+
+  // Helmet for security headers (CSP covers the admin SPA served from here:
+  // Google Fonts, remote https images, blob: previews of picked uploads).
   app.use(
     helmet({
       contentSecurityPolicy: {
         directives: {
           defaultSrc: ["'self'"],
-          styleSrc: ["'self'", "'unsafe-inline'"],
+          styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+          fontSrc: ["'self'", "data:", "https://fonts.gstatic.com"],
           scriptSrc: ["'self'"],
-          imgSrc: ["'self'", "data:", "https:", "http://localhost:*"],
+          imgSrc: ["'self'", "data:", "blob:", "https:", ...(isProduction ? [] : ["http://localhost:*"])],
+          connectSrc: ["'self'", ...(isProduction ? [] : ["ws://localhost:*", "http://localhost:*"])],
+          // Local http testing of the built admin must not be forced to https.
+          upgradeInsecureRequests: isProduction ? [] : null,
         },
       },
       crossOriginEmbedderPolicy: false,
@@ -74,20 +106,17 @@ const setupSecurity = (app) => {
  * Configure general middlewares
  */
 const setupMiddlewares = (app) => {
+  // /api/v1/* → /api/* (versioned alias) + X-API-Version header
+  app.use(apiVersionAlias);
+
   // Gzip compression
   app.use(compression());
 
   // CORS
   app.use(cors(corsConfig));
 
-  // File upload (must be before body parsers to handle multipart/form-data)
-  app.use(
-    fileUpload({
-      limits: { fileSize: securityConfig.maxFileSize },
-      abortOnLimit: true,
-      responseOnLimit: "File size limit exceeded (max 10MB)",
-    }),
-  );
+  // Accept-Language → req.lang; az / ru localize coded error messages
+  app.use(localize);
 
   // Body parsers
   app.use(express.json({ limit: securityConfig.maxPayloadSize }));
@@ -101,16 +130,48 @@ const setupMiddlewares = (app) => {
   // Rate limiting for the API
   app.use("/api", apiRateLimiter);
 
-  // Static files (uploads)
-  app.use("/uploads", express.static("uploads"));
+  // Maintenance mode (503 for non-admin API calls while it is on)
+  app.use("/api", maintenanceGate);
+
+  // Minimum supported app version (426 for older apps that send X-App-Version)
+  app.use("/api", appVersionGate);
+
+  // Multipart parsing only where files are accepted, after the rate limiter,
+  // with hard limits on file / part counts. Add new multipart routes here.
+  app.use(
+    ["/api/uploads", "/api/auth/avatar", "/api/admin/menu/uploads", "/api/admin/restaurants/:id/menu-photos"],
+    fileUpload({
+      limits: {
+        fileSize: securityConfig.maxFileSize,
+        files: securityConfig.maxUploadFiles,
+        parts: securityConfig.maxUploadParts,
+      },
+      abortOnLimit: true,
+      // Raw body (written by express-fileupload), kept in the JSON envelope.
+      responseOnLimit: JSON.stringify({
+        success: false,
+        message: "File size limit exceeded (max 10MB)",
+        code: "FILE_TOO_LARGE",
+      }),
+    }),
+    sanitizeInput,
+  );
+
+  // Static files (uploads) — inert: no sniffing, no scripts, non-images download
+  app.use("/uploads", express.static("uploads", { setHeaders: uploadHeaders }));
 };
 
 /**
  * Configure API routes
  */
 const setupRoutes = (app) => {
+  // Admin Settings policies around routes owned by other modules
+  // (account approval / status, restaurant approval).
+  app.post("/api/auth/login", accountStatusGate);
+  app.use("/api/auth", newAccountPolicy);
+  app.post(["/api/restaurants", "/api/admin/restaurants"], restaurantApprovalGate);
+
   app.use("/api/auth", AuthRouter);
-  app.use("/api/posts", PostRouter);
   app.use("/api/restaurants", RestaurantRouter);
   app.use("/api/reviews", ReviewRouter);
   app.use("/api/admin", AdminRouter);
@@ -119,13 +180,25 @@ const setupRoutes = (app) => {
   app.use("/api/feed", FeedRouter);
   app.use("/api/notifications", NotificationRouter);
   app.use("/api/uploads", UploadRouter);
+  app.use("/api/catalog", CatalogRouter);
+  app.use("/api/content", ContentRouter);
+  app.use("/api/comments", CommentRouter);
+  app.use("/api/reports", ReportRouter);
+  app.use("/api/places", PlacesRouter);
+
+  // Universal links / App Links (before the SPA fallback; JSON, no redirects).
+  app.use("/.well-known", WellKnownRouter);
+  app.use("/", RootAppleRouter);
 
   // Health check
-  app.get("/api/health", (req, res) => {
+  app.get("/api/health", async (req, res) => {
+    const maintenance = await PlatformService.maintenance().catch(() => ({ enabled: false }));
     res.json({
       success: true,
       message: "Server is running",
       timestamp: new Date().toISOString(),
+      mail: MailService.isConfigured() ? "configured" : "not-configured",
+      maintenance: maintenance.enabled,
     });
   });
 };
@@ -162,10 +235,22 @@ const setupClient = (app) => {
     app.use(express.static(path.resolve(dir), { maxAge: "1h", index: false }));
   });
 
-  // SPA fallback for anything that is not an API or upload request.
-  app.get(/^\/(?!api|uploads).*/, (req, res, next) => {
+  // SPA fallback for anything that is not an API or upload request. The
+  // public share landings (/restaurant, /list, /invite, /review) get Open
+  // Graph / Twitter tags for link previews; everything else (admin) is the
+  // untouched index.html (noindex).
+  app.get(/^\/(?!api|uploads).*/, async (req, res, next) => {
     const client = resolveClientIndex();
     if (!client) return next(); // no build yet -> 404 handler
+    try {
+      const html = await LinkPreviewService.render(req, client.indexFile);
+      if (html) {
+        res.set("Cache-Control", "public, max-age=60");
+        return res.type("html").send(html);
+      }
+    } catch (error) {
+      console.error("Link preview error:", error.message);
+    }
     return res.sendFile(client.indexFile);
   });
 
@@ -182,48 +267,11 @@ const setupClient = (app) => {
  */
 const setupErrorHandlers = (app) => {
   // 404 handler
-  app.use((req, res) => {
-    res.status(404).json({
-      success: false,
-      message: "Endpoint not found",
-    });
-  });
+  app.use(notFoundHandler);
 
-  // Central error handler
-  app.use((err, req, res, _next) => {
-    console.error("Server error:", err.message || err);
-
-    // Mongoose validation error
-    if (err.name === "ValidationError") {
-      return res.status(400).json({
-        success: false,
-        message: "Validation error",
-        errors: Object.values(err.errors).map((e) => e.message),
-      });
-    }
-
-    // Mongoose duplicate key
-    if (err.code === 11000) {
-      return res.status(409).json({
-        success: false,
-        message: "This record already exists",
-      });
-    }
-
-    // JWT errors
-    if (err.name === "JsonWebTokenError" || err.name === "TokenExpiredError") {
-      return res.status(401).json({
-        success: false,
-        message: "Session expired",
-      });
-    }
-
-    const statusCode = err.statusCode || 500;
-    res.status(statusCode).json({
-      success: false,
-      message: statusCode === 500 ? "Server error" : err.message,
-    });
-  });
+  // Central error handler (CastError/ValidationError/duplicate key → 400/409,
+  // no stacks or internal messages in responses)
+  app.use(errorHandler);
 };
 
 /**
@@ -245,6 +293,10 @@ const validateEnv = () => {
     .map(([key]) => key);
 
   if (!process.env.MONGODB_URI) missing.push("MONGODB_URI");
+  // Opt-in: refuse to start without SMTP (sign-up / reset e-mails would 503).
+  if (process.env.REQUIRE_SMTP === "true" && (!process.env.SMTP_USER || !process.env.SMTP_PASS)) {
+    missing.push("SMTP_USER", "SMTP_PASS");
+  }
 
   if (missing.length) {
     console.error(
@@ -275,6 +327,43 @@ const initializeServices = async () => {
 
   // Create the default admin if none exists
   await bootstrapAdmin();
+
+  // Seed the admin-managed catalog/content defaults (idempotent), then keep
+  // Restaurant.openNow in step with opening hours.
+  try {
+    await CatalogService.ensureDefaults();
+  } catch (error) {
+    console.error("❌ Error ensuring catalog defaults:", error.message);
+  }
+  OpeningHoursService.start();
+  // Rolling restaurant activity stats ("Top this week", trending sorts).
+  RestaurantStatsService.start();
+
+  // Review migrations (live-only unique index, statuses, numbers, derived
+  // ratings) + orphaned review-photo cleanup.
+  try {
+    await ReviewService.bootstrap();
+  } catch (error) {
+    console.error("❌ Error preparing reviews:", error.message);
+  }
+
+  // Restaurant "🔔 Follow" rows of deleted restaurants / accounts, and
+  // followerCount drift (self-heal).
+  try {
+    const follows = await RestaurantFollowService.reconcile();
+    if (follows.removed || follows.updated) {
+      console.log(`✅ Restaurant follows reconciled (${follows.removed} removed, ${follows.updated} counts fixed)`);
+    }
+  } catch (error) {
+    console.error("❌ Error reconciling restaurant follows:", error.message);
+  }
+
+  // Lift temporary suspensions when they end.
+  ModerationService.start();
+
+  // Admin uploads (restaurant / menu / catalog / content images) nothing
+  // references any more — now and every 6 hours.
+  await UploadSweepService.start();
 
   // Initialize the mail service
   MailService.init();
@@ -332,6 +421,11 @@ startApp();
 // ============ GRACEFUL SHUTDOWN ============
 const shutdown = async (signal) => {
   console.log(`\n⚠️  ${signal} received. Shutting down gracefully...`);
+  OpeningHoursService.stop();
+  RestaurantStatsService.stop();
+  ModerationService.stop();
+  ReviewService.stop();
+  UploadSweepService.stop();
   httpServer.close(async () => {
     await mongoDBService.disconnect();
     console.log("✅ Server closed");
@@ -347,3 +441,13 @@ const shutdown = async (signal) => {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+
+// Crash reporting without extra services: every unexpected error lands in the
+// PM2 log with a timestamp; an uncaught exception restarts the process (PM2).
+process.on("unhandledRejection", (reason) => {
+  console.error(`❌ [${new Date().toISOString()}] Unhandled rejection:`, reason?.stack || reason);
+});
+process.on("uncaughtException", (error) => {
+  console.error(`❌ [${new Date().toISOString()}] Uncaught exception:`, error?.stack || error);
+  process.exit(1);
+});

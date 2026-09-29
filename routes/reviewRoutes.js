@@ -1,17 +1,32 @@
 import { Router } from "#constants";
-import { reviewController } from "#controllers";
+import { reviewController, commentController } from "#controllers";
 import { authenticate, writeRateLimiter } from "#middlewares";
 
 const ReviewRouter = Router();
 
-// Public reads (specific paths before "/:id").
-ReviewRouter.get("/mine", authenticate, reviewController.myReviews);
+// Public: the rating summary only (guests cannot see reviews).
+ReviewRouter.get("/summary", reviewController.getSummary);
+
+// Everything else needs a signed-in user.
+ReviewRouter.use(authenticate);
+
+// Reads (specific paths before "/:id").
+ReviewRouter.get("/mine", reviewController.myReviews);
+ReviewRouter.get("/companions", reviewController.companionCandidates);
+ReviewRouter.get("/photos", reviewController.listPhotos);
 ReviewRouter.get("/", reviewController.listReviews);
 ReviewRouter.get("/:id", reviewController.getReview);
+ReviewRouter.get("/:id/likes", reviewController.listLikes);
+ReviewRouter.get("/:id/comments", commentController.listComments);
 
-// Authenticated writes.
-ReviewRouter.post("/", authenticate, writeRateLimiter, reviewController.createReview);
-ReviewRouter.post("/:id/like", authenticate, reviewController.toggleLike);
-ReviewRouter.delete("/:id", authenticate, reviewController.deleteReview);
+// Writes.
+ReviewRouter.post("/", writeRateLimiter, reviewController.createReview);
+ReviewRouter.post("/label-requests", writeRateLimiter, reviewController.requestLabel);
+ReviewRouter.put("/:id", writeRateLimiter, reviewController.updateReview);
+ReviewRouter.post("/:id/like", reviewController.toggleLike);
+ReviewRouter.post("/:id/view", reviewController.addView);
+ReviewRouter.post("/:id/share", writeRateLimiter, reviewController.shareReview);
+ReviewRouter.post("/:id/comments", writeRateLimiter, commentController.createComment);
+ReviewRouter.delete("/:id", reviewController.deleteReview);
 
 export { ReviewRouter };

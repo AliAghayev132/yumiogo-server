@@ -1,5 +1,4 @@
 export { AuthRouter } from "./authRoutes.js";
-export { PostRouter } from "./postRoutes.js";
 export { RestaurantRouter } from "./restaurantRoutes.js";
 export { ReviewRouter } from "./reviewRoutes.js";
 export { AdminRouter } from "./adminRoutes.js";
@@ -8,3 +7,9 @@ export { UserRouter } from "./userRoutes.js";
 export { FeedRouter } from "./feedRoutes.js";
 export { NotificationRouter } from "./notificationRoutes.js";
 export { UploadRouter } from "./uploadRoutes.js";
+export { CatalogRouter } from "./catalogRoutes.js";
+export { ContentRouter } from "./contentRoutes.js";
+export { CommentRouter } from "./commentRoutes.js";
+export { ReportRouter } from "./reportRoutes.js";
+export { PlacesRouter } from "./placesRoutes.js";
+export { WellKnownRouter, RootAppleRouter } from "./wellKnownRoutes.js";
