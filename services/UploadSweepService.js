@@ -8,6 +8,7 @@ import {
   User,
   Review,
   ContentPage,
+  Faq,
 } from "#models";
 import { FileService } from "./FileService.js";
 
@@ -20,6 +21,9 @@ import { FileService } from "./FileService.js";
  * 6 hours every file older than a day in uploads/restaurants, uploads/menus,
  * uploads/catalog and uploads/content is deleted unless some document still
  * points at it (also soft-deleted restaurants in Trash, which can be restored).
+ *
+ * Skipped entirely when the database looks empty (no restaurant, no member
+ * account — e.g. a wrong MONGODB_URI), see databaseLooksPopulated().
  *
  * Never touched: uploads/catalog/defaults/** and uploads/restaurants/seed/**
  * (images shipped with the app / the demo data),
@@ -77,6 +81,7 @@ class UploadSweepService {
       avatars,
       reviewPhotos,
       pages,
+      faqs,
     ] = await Promise.all([
       distinct(Restaurant, "coverImages"),
       distinct(Restaurant, "logo"),
@@ -88,7 +93,9 @@ class UploadSweepService {
       distinct(OnboardingSlide, "image"),
       distinct(User, "avatar"),
       distinct(Review, "photos"),
-      ContentPage.collection.find({}, { projection: { intro: 1, sections: 1 } }).toArray(),
+      // Rich text: page intro / sections and FAQ answers, English and every translation.
+      ContentPage.collection.find({}, { projection: { intro: 1, sections: 1, translations: 1 } }).toArray(),
+      Faq.collection.find({}, { projection: { answer: 1, translations: 1 } }).toArray(),
     ]);
     return collectRefs([
       covers,
@@ -102,7 +109,22 @@ class UploadSweepService {
       avatars,
       reviewPhotos,
       pages,
+      faqs,
     ]);
+  }
+
+  /**
+   * Safety guard: a server pointed at a wrong / empty MONGODB_URI would see
+   * every real upload as unreferenced. Sweep only when the database clearly
+   * holds the app's data: at least one restaurant or one non-admin account
+   * (a fresh database already has the bootstrap admin and catalog defaults).
+   */
+  static async databaseLooksPopulated() {
+    const [restaurants, members] = await Promise.all([
+      Restaurant.collection.estimatedDocumentCount(),
+      User.collection.countDocuments({ role: { $ne: "admin" } }, { limit: 1 }),
+    ]);
+    return restaurants > 0 || members > 0;
   }
 
   /** Stored paths ("uploads/…") of the files under `dir`, protected folders skipped. */
@@ -141,6 +163,10 @@ class UploadSweepService {
     });
     const result = { scanned: candidates.length, removed: 0, kept: 0, files: [] };
     if (!candidates.length) return result;
+    if (!(await this.databaseLooksPopulated())) {
+      console.warn("⚠️  Upload sweep skipped: the database has no restaurants or users (wrong MONGODB_URI?)");
+      return { ...result, skipped: true };
+    }
 
     const referenced = await this.referencedPaths();
     for (const { stored } of candidates) {
@@ -170,6 +196,7 @@ class UploadSweepService {
         SWEPT_DIRS.some((dir) => p.startsWith(`${dir}/`)),
     );
     if (!wanted.length) return 0;
+    if (!(await this.databaseLooksPopulated())) return 0;
     const referenced = await this.referencedPaths();
     let removed = 0;
     for (const stored of wanted) {

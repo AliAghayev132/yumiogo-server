@@ -1,30 +1,11 @@
 import { Router } from "#constants";
 import { favoriteController } from "#controllers";
 import { authenticate, writeRateLimiter } from "#middlewares";
-import { User } from "#models";
-import { AuthTokenService } from "#services";
+// Shared optional auth: a guest without a token, 401 TOKEN_EXPIRED for an
+// expired one (the app refreshes and replays instead of seeing a guest view).
+import { optionalAuth } from "#middlewares/optionalAuth.js";
 
 const FavoriteRouter = Router();
-
-/**
- * Optional auth for share links: attaches req.user when a valid access token
- * is sent, otherwise continues as a guest (never 401s).
- */
-const optionalAuth = async (req, res, next) => {
-  const header = req.header("Authorization");
-  if (!header?.startsWith("Bearer ")) return next();
-  const decoded = AuthTokenService.verifyAccessToken(header.slice(7));
-  if (!decoded?.id) return next();
-  try {
-    const user = await User.findById(decoded.id).select("-password");
-    if (user && !user.isDeleted && user.status === "active" && decoded.tokenVersion === user.tokenVersion) {
-      req.user = user;
-    }
-  } catch (_error) {
-    // guest
-  }
-  return next();
-};
 
 // Share links (guests may view public / collaborative lists).
 FavoriteRouter.get("/share/:slug", optionalAuth, favoriteController.getSharedList);

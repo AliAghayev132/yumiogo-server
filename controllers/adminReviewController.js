@@ -2,6 +2,7 @@ import { Review, Report, User, Restaurant, Comment, Taxonomy, ReviewLabelRequest
 import { reviewStatuses, reviewReactions, labelRequestStatuses } from "#constants";
 import { ReviewService, CatalogService } from "#services";
 import { asyncHandler, escapeRegex } from "#utils";
+import { cleanTranslations, mergeTranslations } from "#utils/translations.js";
 
 /**
  * Admin review moderation (Reviews page), review labels and label requests.
@@ -121,6 +122,8 @@ const toAdmin = (review, reportCounts = new Map()) => {
     moderationNote: r.moderationNote || "",
     moderatedBy: r.moderatedBy ? publicUser(r.moderatedBy) : null,
     moderatedAt: r.moderatedAt ?? null,
+    // Last content edit by the author (e.g. after a reject / flag).
+    editedAt: r.editedAt ?? null,
     likeCount: r.likeCount || 0,
     commentCount: r.commentCount || 0,
     shareCount: r.shareCount || 0,
@@ -265,18 +268,8 @@ const getReview = asyncHandler(async (req, res) => {
   });
 });
 
-// Author notifications per moderation outcome.
-const STATUS_TITLES = {
-  approved: "Review approved",
-  flagged: "Review flagged",
-  rejected: "Review not published",
-};
-const STATUS_MESSAGES = {
-  approved: (place) => `Your review of ${place} was approved and is now public.`,
-  flagged: (place) => `Your review of ${place} was flagged and is being checked by our team.`,
-  rejected: (place, reason) =>
-    `Your review of ${place} was not published.${reason ? ` Reason: ${reason}` : ""}`,
-};
+// Statuses the author is told about (NOTIFICATION_COPY.system review_<status>).
+const NOTIFIED_STATUSES = ["approved", "flagged", "rejected"];
 
 /**
  * Approve / flag / reject (hide) a review, or send it back to pending.
@@ -294,6 +287,20 @@ const updateReviewStatus = asyncHandler(async (req, res) => {
   const review = await Review.findOne({ _id: req.params.id, isDeleted: false }).populate("restaurant", "name");
   if (!review) return notFound(res);
 
+  // Same status again: no re-notification / recompute (only a new reason is kept).
+  if ((review.status || "approved") === status) {
+    if (reason && reason !== review.moderationNote) {
+      await Review.updateOne({ _id: review._id }, { $set: { moderationNote: reason } });
+    }
+    const fresh = await populateAdmin(Review.findById(review._id));
+    const reportCounts = await openReportCounts([review._id]);
+    return res.json({
+      success: true,
+      message: `Review #${review.number} is already ${status}`,
+      data: { review: toAdmin(fresh, reportCounts) },
+    });
+  }
+
   await ReviewService.setStatus(review, status, { by: req.user._id, note: reason });
 
   // Hiding a review settles its open reports.
@@ -305,13 +312,12 @@ const updateReviewStatus = asyncHandler(async (req, res) => {
     });
   }
 
-  const message = STATUS_MESSAGES[status]?.(review.restaurant?.name || "a restaurant", reason);
-  if (message) {
+  const notified = NOTIFIED_STATUSES.includes(status);
+  if (notified) {
     await ReviewService.notify({
       recipient: review.user,
       type: "system",
-      title: STATUS_TITLES[status],
-      message,
+      copy: { key: `review_${status}`, values: { restaurant: review.restaurant?.name || "", reason } },
       review: review._id,
       restaurant: review.restaurant,
       data: { reviewStatus: status },
@@ -322,7 +328,7 @@ const updateReviewStatus = asyncHandler(async (req, res) => {
   const reportCounts = await openReportCounts([review._id]);
   res.json({
     success: true,
-    message: `Review #${review.number} ${status === "pending" ? "moved to pending" : status}${message ? " — user notified" : ""}`,
+    message: `Review #${review.number} ${status === "pending" ? "moved to pending" : status}${notified ? " — user notified" : ""}`,
     data: { review: toAdmin(fresh, reportCounts) },
   });
 });
@@ -342,8 +348,7 @@ const deleteReview = asyncHandler(async (req, res) => {
   await ReviewService.notify({
     recipient: review.user,
     type: "system",
-    title: "Review removed",
-    message: `Your review of ${review.restaurant?.name || "a restaurant"} was removed.${reason ? ` Reason: ${reason}` : ""}`,
+    copy: { key: "review_removed", values: { restaurant: review.restaurant?.name || "", reason } },
     restaurant: review.restaurant,
     data: { reviewStatus: "deleted" },
   });
@@ -365,7 +370,7 @@ const recompute = asyncHandler(async (req, res) => {
   if (restaurant) {
     if (!isObjectId(restaurant)) return badRequest(res, "Invalid restaurant");
     if (!(await Restaurant.exists({ _id: restaurant }))) return notFound(res, "Restaurant not found");
-    const summary = await ReviewService.recomputeRestaurant(restaurant);
+    const summary = await ReviewService.recomputeRestaurant(restaurant, { withSummary: true });
     return res.json({ success: true, message: "Rating recalculated", data: { restaurant, summary } });
   }
   const result = await ReviewService.recomputeAll();
@@ -405,6 +410,10 @@ const labelFields = (body) => {
     fields.order = order;
   }
   if (body.isActive !== undefined) fields.isActive = toBool(body.isActive);
+  // az / ru name, group and description (optional; empty → English).
+  const translations = cleanTranslations(body.translations, ["name", "group", "description"], { maxLength: 300 });
+  if (translations.error) return { error: translations.error };
+  if (translations.value !== undefined) fields.translations = translations.value;
   return { fields };
 };
 
@@ -486,6 +495,10 @@ const updateLabel = asyncHandler(async (req, res) => {
   const oldName = item.name;
   if (fields.name && fields.name !== oldName && (await labelNameTaken(fields.name, item._id))) {
     return res.status(409).json({ success: false, message: `"${fields.name}" already exists` });
+  }
+  if (fields.translations !== undefined) {
+    const current = item.translations?.toObject ? item.translations.toObject() : item.translations;
+    fields.translations = mergeTranslations(current, fields.translations);
   }
   item.set(fields);
   await item.save();
@@ -607,11 +620,10 @@ const reviewLabelRequest = asyncHandler(async (req, res) => {
   await ReviewService.notify({
     recipient: request.user,
     type: "system",
-    title: status === "approved" ? "Label added" : "Label idea reviewed",
-    message:
+    copy:
       status === "approved"
-        ? `Your label idea "${item.name}" is now available to everyone. Thanks!`
-        : `Your label idea "${request.label}" was not added.${note ? ` ${note}` : ""}`,
+        ? { key: "label_added", values: { label: item.name } }
+        : { key: "label_rejected", values: { label: request.label, note } },
     data: { labelRequestId: String(request._id) },
   });
 

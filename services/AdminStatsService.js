@@ -200,6 +200,7 @@ class AdminStatsService {
       reviewsBefore,
       reportsNow,
       reportsBefore,
+      openReportsBefore,
       pendingRestaurants,
       pendingUsers,
       pendingReviews,
@@ -218,6 +219,12 @@ class AdminStatsService {
       Review.countDocuments({ ...LIVE_REVIEW, ...inPrevious }),
       Report.countDocuments(inPeriod),
       Report.countDocuments(inPrevious),
+      // Reports that were open when the period started: filed before it and still open, or
+      // closed during it (a reopened report counts by its current state).
+      Report.countDocuments({
+        createdAt: { $lt: periodStart },
+        $or: [OPEN_REPORT, { resolvedAt: { $gte: periodStart } }],
+      }),
       Restaurant.countDocuments({ ...LIVE_RESTAURANT, status: "pending" }),
       User.countDocuments({ ...LIVE_USER, status: "pending" }),
       Review.countDocuments(QUEUED_REVIEW),
@@ -236,7 +243,11 @@ class AdminStatsService {
         usersChange: pctChange(usersNow, usersBefore),
         restaurantsChange: pctChange(restaurantsNow, restaurantsBefore),
         reviewsChange: pctChange(reviewsNow, reviewsBefore),
+        // New reports filed in the period vs the previous period.
         reportsChange: pctChange(reportsNow, reportsBefore),
+        // Open reports now vs open at the start of the period (the "Pending reports" card).
+        openReportsBefore,
+        openReportsChange: pctChange(openReports, openReportsBefore),
         newUsers: usersNow,
         newRestaurants: restaurantsNow,
         newReviews: reviewsNow,
@@ -322,7 +333,7 @@ class AdminStatsService {
         title: fullName(l.owner) || "A user",
         detail: `created the list “${l.name}”`,
         at: l.createdAt,
-        link: null,
+        link: `/dashboard/lists?list=${l._id}`,
       })),
     ]
       .sort((a, b) => new Date(b.at) - new Date(a.at))
@@ -380,9 +391,9 @@ class AdminStatsService {
       ]),
       this.topCuisines(4),
       Restaurant.find({ ...LIVE_RESTAURANT, status: "active" })
-        .sort({ reviewCount: -1, rating: -1 })
+        .sort({ reviewCount: -1, rating: -1, _id: 1 })
         .limit(5)
-        .select("name rating reviewCount")
+        .select("name rating reviewCount reviewStats")
         .lean(),
       Restaurant.aggregate([{ $match: LIVE_RESTAURANT }, { $group: { _id: "$status", count: { $sum: 1 } } }]),
       PlatformService.settings(),

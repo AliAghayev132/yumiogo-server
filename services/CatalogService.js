@@ -36,6 +36,7 @@ import {
   DEFAULT_CUISINE_IMAGES,
   LEGACY_SETTINGS,
   LEGACY_PAGES,
+  LEGACY_PRIVACY_DATA_SECTION,
   ONBOARDING_CUISINES,
   ONBOARDING_DIETARY,
   ONBOARDING_ALIASES,
@@ -44,11 +45,16 @@ import { config } from "#config";
 import { MenuItem } from "#models/menuItem.model.js";
 import { setTimezone, isValidTimezone, hasHours } from "#utils";
 import { toMinutes } from "#utils/openingHours.js";
-import { foldText } from "#utils/search.js";
+import { allValues, cleanTranslations, mergeTranslations, TRANSLATED_LANGUAGES } from "#utils/translations.js";
 import { derivePriceLevel } from "#utils/pricing.js";
 import { EncryptionService } from "./EncryptionService.js";
 import { FileService } from "./FileService.js";
 import { MenuService } from "./MenuService.js";
+import { DefaultTranslationsService } from "./DefaultTranslationsService.js";
+import {
+  PAGE_TRANSLATIONS,
+  LEGACY_PRIVACY_DATA_SECTION_TRANSLATIONS,
+} from "#constants/shared/catalogTranslations.js";
 
 /**
  * CatalogService — the admin-managed catalog (taxonomies, cities, content,
@@ -61,9 +67,21 @@ import { MenuService } from "./MenuService.js";
  *  - read models for GET /api/catalog, /admin/meta and the settings editor.
  */
 
+// seededDefaults mark of the default az / ru texts — bump it when
+// constants/shared/catalogTranslations.js gains texts for existing defaults.
+const DEFAULT_TRANSLATIONS_MARK = "translations:v1";
+// seededDefaults mark of the menu search-key format (MenuItem.searchKey /
+// searchText, MenuCategory.searchKey) — bump it when that format changes so
+// every key is re-derived once on the next boot.
+const SEARCH_KEYS_MARK = "searchKeys:v2";
 const ACTIVE_RESTAURANT = { status: "active", isDeleted: false };
 const LIVE_RESTAURANT = { isDeleted: false };
 const BY_ORDER = { order: 1, name: 1 };
+
+// Restaurant usage counts (catalog / Home cuisine counts) and the built public
+// catalog are cached briefly; restaurant / catalog writes invalidate them.
+const COUNTS_TTL_MS = 60 * 1000;
+const CATALOG_TTL_MS = 60 * 1000;
 
 const HEX_COLOR = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -140,6 +158,10 @@ const toItem = (doc) => ({
   ...(ONBOARDING_TYPES.includes(doc.type) ? { showInOnboarding: !!doc.showInOnboarding } : {}),
   // Review labels are grouped under a heading ("Good for", "What was wrong?").
   ...(doc.type === "reviewLabel" ? { group: doc.group || "" } : {}),
+  // English name — what restaurants store and filters take. `name` is
+  // localized for the client's language (utils/translations), `key` never is.
+  key: doc.name,
+  translations: doc.translations || {},
 });
 
 const toCity = (doc) => ({
@@ -151,6 +173,8 @@ const toCity = (doc) => ({
   longitude: doc.longitude,
   isDefault: !!doc.isDefault,
   order: doc.order ?? 0,
+  key: doc.name, // English name (Restaurant.city); `name` / `label` get localized
+  translations: doc.translations || {},
 });
 
 // Keys of the fixed-key Settings lists and the fields the admin may edit.
@@ -188,7 +212,7 @@ const QUICK_FILTERS = ["distance", "rating", "price"];
 const SURPRISE_KEYS = Object.keys(DEFAULT_SETTINGS.surprise);
 const ETA_KEYS = Object.keys(DEFAULT_SETTINGS.eta);
 // Setting groups whose missing keys ensureSettings() fills from the defaults.
-const SETTING_GROUPS = ["filters", "quickFilters", "surprise", "eta", "appLinks", "appVersion"];
+const SETTING_GROUPS = ["filters", "quickFilters", "surprise", "eta", "appLinks", "appVersion", "ratingDisplay"];
 // "1", "1.4" or "1.4.0" (numeric semver core).
 const APP_VERSION = /^\d{1,4}(\.\d{1,4}){0,2}$/;
 // Upload paths that ship with the app (Figma defaults) — never deleted.
@@ -223,14 +247,26 @@ const KEYED_FIELD_RULES = {
   image: "image",
 };
 const KEYED_FIELDS = {
-  sortOptions: ["label", "description", "isActive", "order"],
-  trendingOptions: ["label", "description", "isActive", "order"],
-  recommendations: ["title", "description", "image", "isActive", "order"],
-  priceLevels: ["label", "hint", "maxPrice"],
-  notificationOptions: ["label", "description"],
-  sentiments: ["label", "emoji", "color"],
-  homeSections: ["title", "subtitle", "ctaLabel", "tabLabels", "limit", "isActive", "order"],
+  sortOptions: ["label", "description", "isActive", "order", "translations"],
+  trendingOptions: ["label", "description", "isActive", "order", "translations"],
+  recommendations: ["title", "description", "image", "isActive", "order", "translations"],
+  priceLevels: ["label", "hint", "maxPrice", "translations"],
+  notificationOptions: ["label", "description", "translations"],
+  sentiments: ["label", "emoji", "color", "translations"],
+  homeSections: ["title", "subtitle", "ctaLabel", "tabLabels", "limit", "isActive", "order", "translations"],
 };
+// Text fields of each keyed list that have az / ru versions.
+const KEYED_TRANSLATED = {
+  sortOptions: ["label", "description"],
+  trendingOptions: ["label", "description"],
+  recommendations: ["title", "description"],
+  priceLevels: ["label", "hint"],
+  notificationOptions: ["label", "description"],
+  sentiments: ["label"],
+  homeSections: ["title", "subtitle", "ctaLabel", "tabLabels"],
+};
+// Free-text settings with az / ru versions (Settings.translations).
+const SETTINGS_TRANSLATED = ["maintenanceMessage", "supportReplyNote", "companyAddress"];
 
 const validateKeyedField = (listName, field, value) => {
   const where = `${listName}.${field}`;
@@ -304,6 +340,16 @@ const mergeKeyedList = (listName, incoming, current) => {
     const merged = byKey.get(entry.key) || { key: entry.key };
     for (const field of KEYED_FIELDS[listName]) {
       if (entry[field] === undefined) continue;
+      if (field === "translations") {
+        const { value, error } = cleanTranslations(entry.translations, KEYED_TRANSLATED[listName], {
+          arrays: ["tabLabels"],
+          maxLength: 500,
+          label: `${listName}.translations`,
+        });
+        if (error) return { error };
+        merged.translations = mergeTranslations(merged.translations, value);
+        continue;
+      }
       const result = validateKeyedField(listName, field, entry[field]);
       if (result.error) return result;
       merged[field] = result.value;
@@ -381,7 +427,20 @@ class CatalogService {
     return Settings.getSingleton();
   }
 
-  /** name → number of (non-deleted) restaurants using it; reports for reportReason. */
+  // { key → { at, value: Promise<counts> } } and { key, at, value } of buildCatalog.
+  static countsCache = new Map();
+  static catalogCache = null;
+
+  /** Drop the cached restaurant usage counts (and the catalog built from them). */
+  static invalidateCounts() {
+    this.countsCache.clear();
+    this.catalogCache = null;
+  }
+
+  /**
+   * name → number of (non-deleted) restaurants using it; reports for
+   * reportReason. Restaurant counts are cached for COUNTS_TTL_MS.
+   */
   static async usageCounts(type, match = LIVE_RESTAURANT) {
     if (type === "reportReason") {
       const rows = await Report.aggregate([{ $group: { _id: "$reason", count: { $sum: 1 } } }]);
@@ -397,12 +456,21 @@ class CatalogService {
     }
     const field = TAXONOMY_FIELD[type];
     if (!field) return {};
-    const rows = await Restaurant.aggregate([
+    const key = `${field}|${JSON.stringify(match)}`;
+    const hit = this.countsCache.get(key);
+    if (hit && Date.now() - hit.at < COUNTS_TTL_MS) return { ...(await hit.value) };
+    const value = Restaurant.aggregate([
       { $match: match },
       { $unwind: `$${field}` },
       { $group: { _id: `$${field}`, count: { $sum: 1 } } },
-    ]);
-    return Object.fromEntries(rows.map((r) => [r._id, r.count]));
+    ]).then((rows) => Object.fromEntries(rows.map((r) => [r._id, r.count])));
+    this.countsCache.set(key, { at: Date.now(), value });
+    try {
+      return { ...(await value) };
+    } catch (error) {
+      if (this.countsCache.get(key)?.value === value) this.countsCache.delete(key);
+      throw error;
+    }
   }
 
   /** Active cuisines with active-restaurant counts (Home rail / cuisines endpoint). */
@@ -443,13 +511,14 @@ class CatalogService {
     return (s.homeSections || [])
       .filter((section) => section.isActive)
       .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
-      .map(({ key, title, subtitle, ctaLabel, tabLabels, limit }) => ({
+      .map(({ key, title, subtitle, ctaLabel, tabLabels, limit, translations }) => ({
         key,
         title: title || "",
         subtitle: subtitle || "",
         ctaLabel: ctaLabel || "",
         tabLabels: tabLabels || [],
         limit,
+        translations: translations || {},
       }));
   }
 
@@ -465,6 +534,7 @@ class CatalogService {
       label: byKey.get(key)?.label || key,
       hint: byKey.get(key)?.hint || "",
       maxPrice: byKey.get(key)?.maxPrice ?? null,
+      translations: byKey.get(key)?.translations || {},
     }));
   }
 
@@ -485,6 +555,7 @@ class CatalogService {
       filters[key] = s.filters?.[key] ?? DEFAULT_SETTINGS.filters[key];
     });
     filters.distanceLabels = isPlainObject(s.filters?.distanceLabels) ? s.filters.distanceLabels : {};
+    filters.translations = isPlainObject(s.filters?.translations) ? s.filters.translations : {};
     const eta = {};
     ETA_KEYS.forEach((key) => {
       eta[key] = s.eta?.[key] ?? DEFAULT_SETTINGS.eta[key];
@@ -497,6 +568,12 @@ class CatalogService {
     SURPRISE_KEYS.forEach((key) => {
       surprise[key] = s.surprise?.[key] ?? DEFAULT_SETTINGS.surprise[key];
     });
+    surprise.translations = s.surprise?.translations || {};
+    // az / ru free texts; the walker in the localize middleware swaps them in.
+    const texts = s.translations || {};
+    const maintenanceTranslations = Object.fromEntries(
+      Object.entries(texts).map(([lang, entry]) => [lang, { message: entry?.maintenanceMessage || "" }]),
+    );
     const appLinks = this.appLinks(s);
 
     return {
@@ -508,37 +585,56 @@ class CatalogService {
       timezone: s.timezone,
       defaultLanguage: s.defaultLanguage || "en",
       // The app shows its maintenance screen while this is on (API calls get 503).
-      maintenance: { enabled: !!s.maintenanceMode, message: s.maintenanceMessage || "" },
+      maintenance: {
+        enabled: !!s.maintenanceMode,
+        message: s.maintenanceMessage || "",
+        translations: maintenanceTranslations,
+      },
+      translations: texts,
       filters,
       quickFilters,
       eta,
       // "Sort by" sheet; description = the (?) dialog copy.
-      sortOptions: this.activeOrdered(s.sortOptions).map(({ key, label, description }) => ({
+      sortOptions: this.activeOrdered(s.sortOptions).map(({ key, label, description, translations }) => ({
         key,
         label,
         description: description || "",
+        translations: translations || {},
       })),
       // "Trending this month" sheet (keys are sort keys too).
-      trendingOptions: this.activeOrdered(s.trendingOptions).map(({ key, label, description }) => ({
+      trendingOptions: this.activeOrdered(s.trendingOptions).map(({ key, label, description, translations }) => ({
         key,
         label,
         description: description || "",
+        translations: translations || {},
       })),
       // Recommends / "Popular also search for" tiles (live data: GET /restaurants/recommends).
       recommendations: this.activeOrdered(s.recommendations).map(
-        ({ key, title, description, image }) => ({
+        ({ key, title, description, image, translations }) => ({
           key,
           title,
           description: description || "",
           image: image || null,
+          translations: translations || {},
         }),
       ),
       priceLevels: this.priceLevels(s),
       notificationOptions: inKeyOrder(s.notificationOptions, NOTIFICATION_OPTION_KEYS).map(
-        ({ key, label, description }) => ({ key, label, description: description || "" }),
+        ({ key, label, description, translations }) => ({
+          key,
+          label,
+          description: description || "",
+          translations: translations || {},
+        }),
       ),
       sentiments: inKeyOrder(s.sentiments, reviewReactions).map(
-        ({ key, label, emoji, color }) => ({ key, label, emoji: emoji || "", color: color || null }),
+        ({ key, label, emoji, color, translations }) => ({
+          key,
+          label,
+          emoji: emoji || "",
+          color: color || null,
+          translations: translations || {},
+        }),
       ),
       surprise,
       homeSections: this.homeSections(s),
@@ -547,6 +643,8 @@ class CatalogService {
       // Force / soft update: compare the app's version with these (see appVersion()).
       appVersion: this.appVersion(s),
       inviteGoal: this.inviteGoal(s),
+      // Liked-percentage rating: show reviewStats.likedPercent from this many reviews.
+      ratingDisplay: this.ratingDisplay(s),
       // Origin of the share links / web landing pages (WEB_URL, else APP_URL).
       webUrl: config.webUrl,
     };
@@ -590,6 +688,18 @@ class CatalogService {
   }
 
   /** Friends the Feed "Invite friends" card asks for (1–20). */
+  /**
+   * { minReviewsForPercent } (1–100): from how many public reviews the apps
+   * show the liked percentage; also the "best rated" sort threshold.
+   */
+  static ratingDisplay(settings) {
+    const n = Number(plain(settings)?.ratingDisplay?.minReviewsForPercent);
+    return {
+      minReviewsForPercent:
+        Number.isInteger(n) && n >= 1 && n <= 100 ? n : DEFAULT_SETTINGS.ratingDisplay.minReviewsForPercent,
+    };
+  }
+
   static inviteGoal(settings) {
     const n = Number(plain(settings)?.inviteGoal);
     return Number.isInteger(n) && n >= 1 && n <= 20 ? n : DEFAULT_SETTINGS.inviteGoal;
@@ -614,24 +724,55 @@ class CatalogService {
         .join("\n")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
+    const fillTranslations = (translations, field) =>
+      Object.fromEntries(
+        Object.entries(translations || {}).map(([lang, entry]) => [
+          lang,
+          entry?.[field] ? { ...entry, [field]: fill(entry[field]) } : entry,
+        ]),
+      );
     return {
       ...page,
       intro: fill(page.intro),
-      sections: (page.sections || []).map((section) => ({ ...section, body: fill(section.body) })),
+      translations: fillTranslations(page.translations, "intro"),
+      sections: (page.sections || []).map((section) => ({
+        ...section,
+        body: fill(section.body),
+        translations: fillTranslations(section.translations, "body"),
+      })),
     };
   }
 
-  /** Everything GET /api/catalog returns. */
+  /**
+   * Everything GET /api/catalog returns (language-independent; the localize
+   * middleware localizes a copy). Cached for CATALOG_TTL_MS and rebuilt as soon
+   * as Settings, a taxonomy item or a city changes (latest updatedAt / count).
+   * Callers must not mutate the result.
+   */
   static async buildCatalog() {
-    const [settings, items, cuisineCounts, { cities, defaultCity }, lastTaxonomy, lastCity] =
-      await Promise.all([
-        this.getSettings(),
-        Taxonomy.find({ isActive: true }).sort(BY_ORDER).lean(),
-        this.usageCounts("cuisine", ACTIVE_RESTAURANT),
-        this.activeCities(),
-        Taxonomy.findOne({}, "updatedAt").sort({ updatedAt: -1 }).lean(),
-        City.findOne({}, "updatedAt").sort({ updatedAt: -1 }).lean(),
-      ]);
+    const [settings, lastTaxonomy, lastCity, taxonomyCount, cityCount] = await Promise.all([
+      this.getSettings(),
+      Taxonomy.findOne({}, "updatedAt").sort({ updatedAt: -1 }).lean(),
+      City.findOne({}, "updatedAt").sort({ updatedAt: -1 }).lean(),
+      Taxonomy.estimatedDocumentCount(),
+      City.estimatedDocumentCount(),
+    ]);
+    const stamp = (d) => (d ? new Date(d).getTime() : 0);
+    const key = [stamp(settings.updatedAt), stamp(lastTaxonomy?.updatedAt), stamp(lastCity?.updatedAt), taxonomyCount, cityCount].join("|");
+    const cached = this.catalogCache;
+    if (cached && cached.key === key && Date.now() - cached.at < CATALOG_TTL_MS) return cached.value;
+
+    const value = await this.composeCatalog(settings, lastTaxonomy, lastCity);
+    this.catalogCache = { key, at: Date.now(), value };
+    return value;
+  }
+
+  static async composeCatalog(settings, lastTaxonomy, lastCity) {
+    const [items, cuisineCounts, { cities, defaultCity }] = await Promise.all([
+      Taxonomy.find({ isActive: true }).sort(BY_ORDER).lean(),
+      this.usageCounts("cuisine", ACTIVE_RESTAURANT),
+      this.activeCities(),
+    ]);
 
     const ofType = (type) => items.filter((i) => i.type === type).map(toItem);
     const stamps = [settings.updatedAt, lastTaxonomy?.updatedAt, lastCity?.updatedAt]
@@ -688,11 +829,15 @@ class CatalogService {
     if (!list.length) return { names: [], unknown: [] };
 
     const keepKeys = new Set(toList(keep).map(normalizeName));
-    const items = await Taxonomy.find({ type }, "name isActive").lean();
+    const items = await Taxonomy.find({ type }, "name isActive translations").lean();
     const canonical = new Map();
     items.forEach((item) => {
-      const key = normalizeName(item.name);
-      if (item.isActive || keepKeys.has(key)) canonical.set(key, item.name);
+      if (!item.isActive && !keepKeys.has(normalizeName(item.name))) return;
+      // The English name first, then its az / ru names (a client may send either).
+      allValues(item, "name").forEach((value) => {
+        const key = normalizeName(value);
+        if (!canonical.has(key)) canonical.set(key, item.name);
+      });
     });
 
     const names = [];
@@ -712,9 +857,10 @@ class CatalogService {
   static async resolveCity(value, { keep = "" } = {}) {
     const wanted = normalizeName(value);
     if (!wanted) return { name: "" };
-    const cities = await City.find({}, "name isActive").lean();
+    const cities = await City.find({}, "name label isActive translations").lean();
+    const names = (c) => [...allValues(c, "name"), ...allValues(c, "label")].map(normalizeName);
     const match = cities.find(
-      (c) => normalizeName(c.name) === wanted && (c.isActive || normalizeName(keep) === wanted),
+      (c) => names(c).includes(wanted) && (c.isActive || normalizeName(keep) === normalizeName(c.name)),
     );
     return match ? { name: match.name } : { unknown: cleanName(value) };
   }
@@ -770,6 +916,11 @@ class CatalogService {
       update[key] = body[key].trim();
     }
     if (update.appName === "") return { error: "App name is required" };
+    if (body.translations !== undefined) {
+      const { value, error } = cleanTranslations(body.translations, SETTINGS_TRANSLATED, { maxLength: 500 });
+      if (error) return { error };
+      update.translations = mergeTranslations(current.translations, value);
+    }
     if (update.maintenanceMessage !== undefined && update.maintenanceMessage.length > 300) {
       return { error: "Maintenance message must be at most 300 characters" };
     }
@@ -831,6 +982,29 @@ class CatalogService {
           labels[String(Number(metres))] = label.trim();
         }
         filters.distanceLabels = labels;
+      }
+      // { az: { distanceLabels: { "<metres>": "…" } }, ru: { … } }
+      if (body.filters.translations !== undefined) {
+        const input = body.filters.translations;
+        if (input !== null && !isPlainObject(input)) return { error: "filters.translations must be an object" };
+        const translations = isPlainObject(filters.translations) ? { ...filters.translations } : {};
+        for (const lang of TRANSLATED_LANGUAGES) {
+          const labels = input?.[lang]?.distanceLabels;
+          if (labels === undefined) continue;
+          if (labels !== null && !isPlainObject(labels)) {
+            return { error: `filters.translations.${lang}.distanceLabels must be an object keyed by metres` };
+          }
+          const clean = {};
+          for (const [metres, label] of Object.entries(labels || {})) {
+            if (label === null || label === "") continue;
+            if (typeof label !== "string" || label.trim().length > 30) {
+              return { error: "filters.translations distance labels must be strings of at most 30 characters" };
+            }
+            clean[String(Number(metres))] = label.trim();
+          }
+          translations[lang] = { distanceLabels: clean };
+        }
+        filters.translations = translations;
       }
       update.filters = filters;
     }
@@ -934,6 +1108,20 @@ class CatalogService {
       update.inviteGoal = n;
     }
 
+    if (body.ratingDisplay !== undefined) {
+      if (!isPlainObject(body.ratingDisplay)) return { error: "ratingDisplay must be an object" };
+      const ratingDisplay = this.ratingDisplay(current);
+      for (const key of Object.keys(body.ratingDisplay)) {
+        if (key !== "minReviewsForPercent") return { error: `Unknown ratingDisplay key: ${key}` };
+        const n = toNumber(body.ratingDisplay[key]);
+        if (n === null || !Number.isInteger(n) || n < 1 || n > 100) {
+          return { error: "ratingDisplay.minReviewsForPercent must be a whole number from 1 to 100" };
+        }
+        ratingDisplay[key] = n;
+      }
+      update.ratingDisplay = ratingDisplay;
+    }
+
     if (body.surprise !== undefined) {
       if (!isPlainObject(body.surprise)) return { error: "surprise must be an object" };
       const surprise = { ...DEFAULT_SETTINGS.surprise, ...(current.surprise || {}) };
@@ -943,6 +1131,14 @@ class CatalogService {
           return { error: `surprise.${key} must be a non-empty string` };
         }
         surprise[key] = body.surprise[key].trim();
+      }
+      if (body.surprise.translations !== undefined) {
+        const { value, error } = cleanTranslations(body.surprise.translations, SURPRISE_KEYS, {
+          maxLength: 300,
+          label: "surprise.translations",
+        });
+        if (error) return { error };
+        surprise.translations = mergeTranslations(current.surprise?.translations, value);
       }
       update.surprise = surprise;
     }
@@ -955,6 +1151,7 @@ class CatalogService {
   /** Rename cascade → number of restaurants (reports for reportReason) updated. */
   static async cascadeRename(type, oldName, newName) {
     if (!oldName || oldName === newName) return 0;
+    this.invalidateCounts();
     let cascaded = 0;
 
     const field = TAXONOMY_FIELD[type];
@@ -1001,6 +1198,7 @@ class CatalogService {
 
   /** Delete cascade ($pull the name) → number of restaurants updated. */
   static async cascadeDelete(type, name) {
+    this.invalidateCounts();
     let removedFrom = 0;
 
     const field = TAXONOMY_FIELD[type];
@@ -1046,7 +1244,9 @@ class CatalogService {
    *  - taxonomies: a default is inserted only when no item with that (type, slug)
    *    or name exists AND it was never inserted before (deleted stays deleted);
    *  - cities / FAQs / onboarding: only into an empty, never-seeded collection;
-   *  - pages: only missing, never-seeded slugs.
+   *  - pages: only missing, never-seeded slugs;
+   *  - az / ru texts of the defaults: only empty translation fields of texts
+   *    that still equal the English default (DefaultTranslationsService).
    * Then imports every value restaurants already use so existing data stays valid.
    */
   static async ensureDefaults() {
@@ -1130,11 +1330,32 @@ class CatalogService {
     // Figma Privacy / Cookies copy — once, only while a page is still the old default.
     marks.push("pages:figma");
     if (!seeded.has("pages:figma")) await this.migrateLegalPages();
+    // Privacy "Your Data & Rights" cut down to the "we do not sell" statement —
+    // once, only while that section is still the shipped text.
+    marks.push("pages:privacyDataSection");
+    if (!seeded.has("pages:privacyDataSection")) await this.migratePrivacyDataSection();
 
     const imported = await this.importRestaurantValues();
     await this.migrateRestaurants();
     const dishes = await MenuService.importLegacyPopularDishes();
     if (dishes) console.log(`✅ Imported ${dishes} popular dishes into restaurant menus`);
+
+    // az / ru texts of the defaults (also for databases seeded before them) —
+    // once per translation set, only into empty fields of still-default texts,
+    // so an admin who clears or rewrites a translation keeps it that way.
+    marks.push(DEFAULT_TRANSLATIONS_MARK);
+    if (!seeded.has(DEFAULT_TRANSLATIONS_MARK)) await DefaultTranslationsService.fill();
+    // Folded restaurant search keys in every language, incl. the city's az / ru
+    // names (after the fill above; derived on save from now on; only changed
+    // keys are written).
+    await Restaurant.refreshSearchKeys({});
+    // Menu item / section search keys: missing ones always, every one once per
+    // key format (SEARCH_KEYS_MARK).
+    marks.push(SEARCH_KEYS_MARK);
+    const menuKeys = await MenuService.refreshSearchKeys({ all: !seeded.has(SEARCH_KEYS_MARK) });
+    if (menuKeys.items || menuKeys.categories) {
+      console.log(`✅ Menu search keys refreshed (${menuKeys.items} items, ${menuKeys.categories} sections)`);
+    }
 
     await Settings.updateOne(
       { key: "app" },
@@ -1378,25 +1599,17 @@ class CatalogService {
       { timestamps: false },
     );
 
-    // Folded search keys + first publication date (derived on save from now on).
+    // First publication date (derived on save from now on).
     const stale = await Restaurant.find(
-      { $or: [{ "search.name": { $exists: false } }, { publishedAt: { $exists: false } }] },
-      "name address city status createdAt search publishedAt",
+      { publishedAt: { $exists: false } },
+      "status createdAt publishedAt",
     ).lean();
     if (stale.length) {
       await Restaurant.bulkWrite(
         stale.map((r) => ({
           updateOne: {
             filter: { _id: r._id },
-            update: {
-              $set: {
-                search: {
-                  name: foldText(r.name),
-                  address: foldText([r.address, r.city].filter(Boolean).join(" ")),
-                },
-                publishedAt: r.publishedAt ?? (r.status === "active" ? r.createdAt : null),
-              },
-            },
+            update: { $set: { publishedAt: r.status === "active" ? r.createdAt : null } },
             timestamps: false,
           },
         })),
@@ -1501,6 +1714,44 @@ class CatalogService {
       replaced += 1;
     }
     return replaced;
+  }
+
+  /**
+   * Replace the Privacy page's "Your Data & Rights" section with the short
+   * "we do not sell your personal data" section of DEFAULT_PAGES while its
+   * English heading and body are still exactly the shipped text
+   * (LEGACY_PRIVACY_DATA_SECTION); an admin-edited section is never touched.
+   * az / ru: replaced where empty or still the shipped translation.
+   * → true when the section was replaced
+   */
+  static async migratePrivacyDataSection() {
+    const page = await ContentPage.findOne({ slug: "privacy" }, "sections").lean();
+    const index = (page?.sections || []).findIndex(
+      (x) => x.heading === LEGACY_PRIVACY_DATA_SECTION.heading && x.body === LEGACY_PRIVACY_DATA_SECTION.body,
+    );
+    if (index === -1) return false;
+
+    const next = DEFAULT_PAGES.find((p) => p.slug === "privacy").sections.at(-1);
+    const nextTranslations = PAGE_TRANSLATIONS.privacy.sections.at(-1);
+    const current = page.sections[index].translations || {};
+    const translations = Object.fromEntries(
+      TRANSLATED_LANGUAGES.map((lang) => {
+        const entry = current[lang] || {};
+        const value = (field) => {
+          const stored = typeof entry[field] === "string" ? entry[field] : "";
+          const shipped = LEGACY_PRIVACY_DATA_SECTION_TRANSLATIONS[field]?.[lang];
+          return stored.trim() && stored !== shipped ? stored : nextTranslations[field][lang];
+        };
+        return [lang, { heading: value("heading"), body: value("body") }];
+      }),
+    );
+
+    const path = `sections.${index}`;
+    const res = await ContentPage.updateOne(
+      { _id: page._id, [`${path}.heading`]: LEGACY_PRIVACY_DATA_SECTION.heading, [`${path}.body`]: LEGACY_PRIVACY_DATA_SECTION.body },
+      { $set: { [`${path}.heading`]: next.heading, [`${path}.body`]: next.body, [`${path}.translations`]: translations } },
+    );
+    return res.modifiedCount > 0;
   }
 
   /**

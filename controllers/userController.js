@@ -1,7 +1,7 @@
 import { User, Review, FavoriteList, Notification, Restaurant } from "#models";
 import { hashContact, VISIBILITY_OPTIONS, USER_LANGUAGES } from "#models/user.model.js";
 import { mongoose } from "#lib";
-import { AccountService, CatalogService, HashService } from "#services";
+import { AccountService, CatalogService, HashService, FollowRequestService, socketService } from "#services";
 import { ReviewService } from "#services/ReviewService.js";
 import { asyncHandler, escapeRegex } from "#utils";
 import { config } from "#config";
@@ -12,7 +12,9 @@ import { config } from "#config";
  *
  * Visibility: settings.reviewsVisibility / listsVisibility (everyone /
  * followers / me). `isPrivate` accounts show reviews and lists to followers
- * only and are left out of suggestions.
+ * only, are left out of suggestions, and following them takes a follow
+ * request the owner accepts (FollowRequestService). Every person row carries
+ * `followStatus` ("none" | "requested" | "following") next to `isFollowing`.
  */
 
 const ACTIVE = { isDeleted: false, status: "active" };
@@ -77,15 +79,12 @@ const relation = (viewer, target) => {
   return { isMe, isFollowing, followsYou };
 };
 
-/** Can the viewer see activity guarded by `setting` (everyone / followers / me)? */
-const canSee = (setting, target, rel, viewer) => {
-  if (rel.isMe || viewer?.role === "admin") return true;
-  let level = VISIBILITY_OPTIONS.includes(setting) ? setting : "everyone";
-  if (target.isPrivate && level === "everyone") level = "followers";
-  if (level === "everyone") return true;
-  if (level === "followers") return rel.isFollowing;
-  return false;
-};
+/**
+ * Can the viewer see activity guarded by `setting` (everyone / followers / me)?
+ * Only accepted follows count (a pending follow request is not a follow).
+ */
+const canSee = (setting, target, rel, viewer) =>
+  rel.isMe || AccountService.canSeeVisibility(setting, target, viewer);
 
 /** Reviews tab: ReviewService's reviewsVisibility rule + private accounts (followers only). */
 const canSeeReviews = (target, rel, viewer) =>
@@ -111,9 +110,11 @@ const withFlags = async (users, viewer, { mutual = false } = {}) => {
     ]);
     mutualCounts = new Map(rows.map((r) => [String(r._id), r.count]));
   }
+  const statuses = await FollowRequestService.statusMap(viewer, users.map((u) => u._id));
   return users.map((u) => ({
     ...publicUser(u),
     isFollowing: myFollowing.has(String(u._id)),
+    followStatus: String(u._id) === me ? "none" : statuses.get(String(u._id)) || "none",
     followsYou: (u.following || []).some((f) => String(f) === me),
     isMe: String(u._id) === me,
     ...(mutual ? { mutualCount: mutualCounts.get(String(u._id)) || 0 } : {}),
@@ -123,11 +124,16 @@ const withFlags = async (users, viewer, { mutual = false } = {}) => {
 const followerCount = (userId) => User.countDocuments({ following: userId, ...ACTIVE });
 
 // Reviews the viewer may see for `target`: all of my own (any status), else
-// ReviewService's public filter (approved, author active) minus stealth reviews.
-const reviewFilter = async (target, rel) =>
-  rel.isMe
+// ReviewService's public filter (approved, author active) minus stealth reviews;
+// only of public restaurants (filtered in the query, so totals / pages are right).
+const reviewFilter = async (target, rel) => {
+  const filter = rel.isMe
     ? { user: target._id, isDeleted: false }
     : { ...(await ReviewService.publicFilter({ user: target._id })), isStealth: { $ne: true } };
+  const reviewed = await Review.distinct("restaurant", filter);
+  const live = reviewed.length ? await Restaurant.distinct("_id", { _id: { $in: reviewed }, ...LIVE_RESTAURANT }) : [];
+  return { ...filter, restaurant: { $in: live } };
+};
 
 // Lists the viewer may see for `target`.
 const listFilter = (target, rel) =>
@@ -135,13 +141,16 @@ const listFilter = (target, rel) =>
     ? { owner: target._id, isDeleted: false }
     : { owner: target._id, isDeleted: false, privacy: { $in: ["public", "collaborative"] } };
 
-/** Profile stats (followers / following / reviews / lists). */
-const statsFor = async (target, rel) => {
+/**
+ * Profile stats (followers / following / reviews / lists). Review / list
+ * counts the viewer may not see (visibility settings, private account) are 0.
+ */
+const statsFor = async (target, rel, { canViewReviews = true, canViewLists = true } = {}) => {
   const [followers, following, reviews, lists] = await Promise.all([
     followerCount(target._id),
     User.countDocuments({ _id: { $in: target.following || [] }, ...ACTIVE }),
-    reviewFilter(target, rel).then((filter) => Review.countDocuments(filter)),
-    FavoriteList.countDocuments(listFilter(target, rel)),
+    canViewReviews ? reviewFilter(target, rel).then((filter) => Review.countDocuments(filter)) : 0,
+    canViewLists ? FavoriteList.countDocuments(listFilter(target, rel)) : 0,
   ]);
   return { followers, following, reviews, lists };
 };
@@ -157,6 +166,7 @@ const fetchReviews = async (target, rel, viewer, { skip, limit }) => {
       .populate({ path: "restaurant", match: LIVE_RESTAURANT, select: `${ReviewService.RESTAURANT_FIELDS} slug` }),
     Review.countDocuments(filter),
   ]);
+  // (A restaurant hidden between the two queries is still dropped.)
   const reviews = rows.filter((r) => r.restaurant).map((r) => ReviewService.toPublic(r, viewer));
   return { reviews, total };
 };
@@ -164,7 +174,7 @@ const fetchReviews = async (target, rel, viewer, { skip, limit }) => {
 const fetchLists = async (target, rel, viewerId) => {
   const lists = await FavoriteList.find(listFilter(target, rel))
     .sort({ isDefault: -1, updatedAt: -1 })
-    .populate({ path: "items.restaurant", match: LIVE_RESTAURANT, select: "coverImages name" })
+    .populate({ path: "items.restaurant", match: LIVE_RESTAURANT, select: "coverImages name translations" })
     .populate("collaborators.user", "firstName lastName avatar verified isDeleted status");
   return lists.map((l) => l.toSummary(viewerId));
 };
@@ -184,7 +194,11 @@ const getProfile = asyncHandler(async (req, res) => {
   const canViewReviews = canSeeReviews(user, rel, req.user);
   const canViewLists = canSee(settings.listsVisibility, user, rel, req.user);
 
-  const [stats, [row]] = await Promise.all([statsFor(user, rel), withFlags([user], req.user, { mutual: !rel.isMe })]);
+  const [stats, [row], followRequestCount] = await Promise.all([
+    statsFor(user, rel, { canViewReviews, canViewLists }),
+    withFlags([user], req.user, { mutual: !rel.isMe }),
+    rel.isMe ? FollowRequestService.countFor(user._id) : null,
+  ]);
 
   const data = {
     user: {
@@ -197,13 +211,18 @@ const getProfile = asyncHandler(async (req, res) => {
             preferences: user.preferences,
             authProvider: user.authProvider || "local",
             hasPassword: user.hasPassword(),
+            followRequestCount,
           }
         : {}),
+      followStatus: row.followStatus,
     },
-    stats,
+    stats: rel.isMe ? { ...stats, followRequestCount } : stats,
     isMe: rel.isMe,
     isFollowing: rel.isFollowing,
+    // "none" | "requested" (pending request to a private account) | "following"
+    followStatus: row.followStatus,
     followsYou: rel.followsYou,
+    ...(rel.isMe ? { followRequestCount } : {}),
     mutualCount: row.mutualCount || 0,
     privacy: {
       isPrivate: !!user.isPrivate,
@@ -273,8 +292,10 @@ const getUserLists = asyncHandler(async (req, res) => {
 // ================================================================= follow
 
 /**
- * Follow a user.
+ * Follow a user. A private account the viewer doesn't follow yet gets a
+ * follow request instead (idempotent) → followStatus "requested".
  * POST /api/users/:id/follow
+ *   → { followStatus: "following" | "requested", following, requested, followers, followsYou }
  */
 const followUser = asyncHandler(async (req, res) => {
   const targetId = req.params.id;
@@ -282,8 +303,26 @@ const followUser = asyncHandler(async (req, res) => {
   if (targetId === String(req.user._id)) {
     return fail(res, 400, "You cannot follow yourself", "FOLLOW_SELF");
   }
-  const target = await User.findOne({ _id: targetId, ...ACTIVE }, "_id following");
+  const target = await User.findOne({ _id: targetId, ...ACTIVE }, "_id following isPrivate");
   if (!target) return fail(res, 404, "User not found", "USER_NOT_FOUND");
+  const followsYou = (target.following || []).some((f) => String(f) === String(req.user._id));
+
+  const alreadyFollowing = await User.exists({ _id: req.user._id, following: target._id });
+  if (target.isPrivate && !alreadyFollowing) {
+    await FollowRequestService.request(req.user._id, target._id);
+    await User.updateOne({ _id: req.user._id }, { $pull: { dismissedSuggestions: target._id } });
+    return res.json({
+      success: true,
+      message: "Follow request sent",
+      data: {
+        following: false,
+        requested: true,
+        followStatus: "requested",
+        followers: await followerCount(target._id),
+        followsYou,
+      },
+    });
+  }
 
   const result = await User.updateOne(
     { _id: req.user._id, following: { $ne: target._id } },
@@ -298,21 +337,82 @@ const followUser = asyncHandler(async (req, res) => {
     success: true,
     data: {
       following: true,
+      requested: false,
+      followStatus: "following",
       followers: await followerCount(target._id),
-      followsYou: (target.following || []).some((f) => String(f) === String(req.user._id)),
+      followsYou,
     },
   });
 });
 
 /**
- * Unfollow a user.
- * DELETE /api/users/:id/follow
+ * Unfollow a user, or cancel my pending follow request.
+ * DELETE /api/users/:id/follow → { followStatus: "none", following: false, requested: false, followers }
  */
 const unfollowUser = asyncHandler(async (req, res) => {
   const targetId = req.params.id;
   if (!AccountService.isObjectId(targetId)) return fail(res, 404, "User not found", "USER_NOT_FOUND");
   await User.updateOne({ _id: req.user._id }, { $pull: { following: targetId } });
-  res.json({ success: true, data: { following: false, followers: await followerCount(targetId) } });
+  await FollowRequestService.cancel(req.user._id, targetId);
+  res.json({
+    success: true,
+    data: { following: false, requested: false, followStatus: "none", followers: await followerCount(targetId) },
+  });
+});
+
+// ======================================================= follow requests
+
+/**
+ * Follow requests to my (private) account, newest first.
+ * GET /api/users/me/follow-requests?page=&limit=
+ *   → { requests: [{ _id, user (person row), createdAt }], pagination }
+ */
+const getFollowRequests = asyncHandler(async (req, res) => {
+  const paging = pageParams(req.query);
+  const { rows, total } = await FollowRequestService.incoming(req.user._id, paging);
+  const people = await withFlags(rows.map((r) => r.requester), req.user);
+  const requests = rows.map((r, i) => ({ _id: r._id, user: people[i], createdAt: r.createdAt }));
+  res.json({ success: true, data: { requests, pagination: pagination(paging, total) } });
+});
+
+/**
+ * Accept a follow request: the requester now follows me and is notified
+ * ("follow_accept").
+ * POST /api/users/me/follow-requests/:userId/accept → { userId, followerCount, followRequestCount }
+ */
+const acceptFollowRequest = asyncHandler(async (req, res) => {
+  const requesterId = req.params.userId;
+  if (!AccountService.isObjectId(requesterId)) {
+    return fail(res, 404, "Follow request not found", "FOLLOW_REQUEST_NOT_FOUND");
+  }
+  const { accepted } = await FollowRequestService.accept(req.user._id, requesterId);
+  if (!accepted) return fail(res, 404, "Follow request not found", "FOLLOW_REQUEST_NOT_FOUND");
+  const [followers, followRequestCount] = await Promise.all([
+    followerCount(req.user._id),
+    FollowRequestService.countFor(req.user._id),
+  ]);
+  res.json({
+    success: true,
+    message: "Follow request accepted",
+    data: { userId: requesterId, accepted: true, followerCount: followers, followRequestCount },
+  });
+});
+
+/**
+ * Decline a follow request (the requester is not told). Idempotent.
+ * POST /api/users/me/follow-requests/:userId/decline → { userId, declined, followRequestCount }
+ */
+const declineFollowRequest = asyncHandler(async (req, res) => {
+  const requesterId = req.params.userId;
+  if (!AccountService.isObjectId(requesterId)) {
+    return fail(res, 404, "Follow request not found", "FOLLOW_REQUEST_NOT_FOUND");
+  }
+  const declined = await FollowRequestService.decline(req.user._id, requesterId);
+  res.json({
+    success: true,
+    message: "Follow request declined",
+    data: { userId: requesterId, declined, followRequestCount: await FollowRequestService.countFor(req.user._id) },
+  });
 });
 
 /**
@@ -412,7 +512,8 @@ const searchUsers = asyncHandler(async (req, res) => {
  *   { type, text (English, kept for older clients), ...params } where params
  *   let the apps build the sentence in their own language:
  *   follows_you   → {}
- *   mutual        → { name, userId, count, more }  ("Followed by <name> + <more> more")
+ *   mutual        → { name (= firstName), firstName, lastName, userId, user: { _id, firstName,
+ *                     lastName, avatar }, count, more }  ("Followed by <name> + <more> more")
  *   same_city     → { city }                        ("Also in <city>")
  *   similar_taste → { cuisine }                     ("Also loves <cuisine>")
  *   popular       → {}
@@ -421,7 +522,9 @@ const searchUsers = asyncHandler(async (req, res) => {
 const getSuggested = asyncHandler(async (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 30);
   const me = await User.findById(req.user._id, "following dismissedSuggestions city preferences");
-  const exclude = [me._id, ...(me.following || []), ...(me.dismissedSuggestions || [])];
+  // People I follow, dismissed, or already asked to follow (pending request).
+  const requested = await FollowRequestService.requestedBy(me._id);
+  const exclude = [me._id, ...(me.following || []), ...(me.dismissedSuggestions || []), ...requested];
   const base = { ...ACTIVE, role: "user", _id: { $nin: exclude } };
   const scored = new Map(); // id → { score, reason }
   const bump = (id, score, reason) => {
@@ -462,19 +565,26 @@ const getSuggested = asyncHandler(async (req, res) => {
   followers.forEach((u) => bump(u._id, 100, { type: "follows_you", text: "Follows you" }));
 
   const viaIds = [...new Set(fof.map((r) => String(r.via)))];
-  const viaUsers = viaIds.length ? await User.find({ _id: { $in: viaIds } }, "firstName").lean() : [];
-  const viaName = new Map(viaUsers.map((u) => [String(u._id), u.firstName]));
+  const viaUsers = viaIds.length
+    ? await User.find({ _id: { $in: viaIds }, ...ACTIVE }, "firstName lastName avatar").lean()
+    : [];
+  const viaById = new Map(viaUsers.map((u) => [String(u._id), u]));
   fof.forEach((r) => {
-    const known = viaName.get(String(r.via));
-    const name = known || "a friend";
-    const more = r.count - 1;
+    // The app builds "Followed by <name> + N more" itself, so the reason always
+    // names a real person; a candidate whose link just went away is skipped.
+    const via = viaById.get(String(r.via));
+    if (!via?.firstName) return;
+    const more = Math.max(0, r.count - 1);
     bump(r._id, 50 + r.count * 5, {
       type: "mutual",
-      text: more > 0 ? `Followed by ${name} + ${more} more` : `Followed by ${name}`,
-      name: known || null,
-      userId: String(r.via),
+      text: more > 0 ? `Followed by ${via.firstName} + ${more} more` : `Followed by ${via.firstName}`,
+      name: via.firstName,
+      firstName: via.firstName,
+      lastName: via.lastName || "",
+      userId: String(via._id),
+      user: { _id: via._id, firstName: via.firstName, lastName: via.lastName || "", avatar: via.avatar || null },
       count: r.count,
-      more: Math.max(0, more),
+      more,
     });
   });
 
@@ -599,8 +709,22 @@ const matchContacts = asyncHandler(async (req, res) => {
   const matches = rows.map((row) => {
     const u = byId.get(String(row._id));
     const viaEmail = u.emailHash && emailHashes.has(u.emailHash);
+    // Private accounts I don't follow: name and photo only.
+    const person =
+      u.isPrivate && !row.isFollowing
+        ? {
+            _id: row._id,
+            firstName: row.firstName,
+            lastName: row.lastName,
+            avatar: row.avatar,
+            isPrivate: true,
+            isFollowing: false,
+            followStatus: row.followStatus,
+            isMe: false,
+          }
+        : row;
     return {
-      ...row,
+      ...person,
       matchedBy: viaEmail ? "email" : "phone",
       contact: viaEmail ? emailHashes.get(u.emailHash) : phoneHashes.get(u.phoneHash),
     };
@@ -610,7 +734,21 @@ const matchContacts = asyncHandler(async (req, res) => {
 
 // ================================================================ invites
 
-const invitePayload = async (userId) => {
+// Share-sheet text of the invite ({name} = inviter's first name, {url} = link).
+const INVITE_MESSAGE = {
+  en: "{name} invited you to Yumio — discover the places your friends love: {url}",
+  az: "{name} sizi Yumio-ya dəvət edir — dostlarınızın sevdiyi məkanları kəşf edin: {url}",
+  ru: "{name} приглашает вас в Yumio — откройте места, которые любят ваши друзья: {url}",
+};
+const INVITE_SELF = { en: "I", az: "Mən", ru: "Я" };
+const inviteMessage = (lang, firstName, url) => {
+  const key = INVITE_MESSAGE[lang] ? lang : "en";
+  // Without a name: "I invited you…" only reads right in English — use the generic az / ru wording.
+  const name = firstName || INVITE_SELF[key];
+  return INVITE_MESSAGE[key].replace("{name}", name).replace("{url}", url);
+};
+
+const invitePayload = async (userId, lang = "en") => {
   const code = await AccountService.ensureInviteCode(userId);
   const [user, joined, settings] = await Promise.all([
     User.findById(userId, "invitesSent firstName").lean(),
@@ -623,7 +761,7 @@ const invitePayload = async (userId) => {
     code,
     url: `${config.webUrl}/invite/${code}`,
     deepLink: `yumio://invite/${code}`,
-    message: `${user?.firstName || "I"} invited you to Yumio — discover the places your friends love: ${config.webUrl}/invite/${code}`,
+    message: inviteMessage(lang, user?.firstName, `${config.webUrl}/invite/${code}`),
     sent: user?.invitesSent || 0,
     joined,
     goal,
@@ -637,7 +775,7 @@ const invitePayload = async (userId) => {
  * GET /api/users/me/invite
  */
 const getInvite = asyncHandler(async (req, res) => {
-  res.json({ success: true, data: await invitePayload(req.user._id) });
+  res.json({ success: true, data: await invitePayload(req.user._id, req.lang) });
 });
 
 /**
@@ -646,7 +784,7 @@ const getInvite = asyncHandler(async (req, res) => {
  */
 const markInviteSent = asyncHandler(async (req, res) => {
   await User.updateOne({ _id: req.user._id }, { $inc: { invitesSent: 1 } });
-  res.json({ success: true, data: await invitePayload(req.user._id) });
+  res.json({ success: true, data: await invitePayload(req.user._id, req.lang) });
 });
 
 /**
@@ -677,16 +815,15 @@ const redeemInvite = asyncHandler(async (req, res) => {
 // ============================================================ me: devices
 
 /**
- * Register this device's Expo push token.
+ * Register this device's Expo push token (newest first, a few per account;
+ * the token leaves any other account that signed in on this device before).
  * POST /api/users/me/push-token  { token }
  */
 const addPushToken = asyncHandler(async (req, res) => {
   const token = String(req.body?.token ?? "");
   if (!PUSH_TOKEN.test(token)) return fail(res, 400, "Invalid push token", "PUSH_TOKEN_INVALID");
-  const user = await User.findById(req.user._id, "pushTokens");
-  const tokens = [token, ...(user.pushTokens || []).filter((t) => t !== token)].slice(0, 10);
-  await User.updateOne({ _id: req.user._id }, { $set: { pushTokens: tokens } });
-  res.json({ success: true, message: "Push token saved", data: { devices: tokens.length } });
+  const devices = await AccountService.addPushToken(req.user._id, token);
+  res.json({ success: true, message: "Push token saved", data: { devices } });
 });
 
 /**
@@ -700,47 +837,24 @@ const removePushToken = asyncHandler(async (req, res) => {
 });
 
 /**
- * Share a restaurant or a list with people I follow / who follow me
- * ("Send a message" sheet) → "share" notifications.
- * POST /api/users/me/share  { userIds: [], restaurant? | list? }
+ * In-app sending of restaurants / lists to Yumio users ("Send a message"
+ * sheet) is switched off — people share the link instead. Old "share"
+ * notifications keep rendering.
+ * POST /api/users/me/share → 400 SHARE_DISABLED
  */
-const shareWithPeople = asyncHandler(async (req, res) => {
-  const { restaurant, list } = req.body || {};
-  const ids = [...new Set((Array.isArray(req.body?.userIds) ? req.body.userIds : []).map(String))].filter(
-    AccountService.isObjectId,
-  );
-  if (!ids.length || ids.length > 20) return fail(res, 400, "Choose 1–20 people", "USER_IDS_INVALID");
-  if (!restaurant === !list) return fail(res, 400, "Share either a restaurant or a list", "SHARE_TARGET_INVALID");
-
-  const ref = {};
-  if (restaurant) {
-    if (!AccountService.isObjectId(String(restaurant))) return fail(res, 404, "Restaurant not found", "RESTAURANT_NOT_FOUND");
-    const found = await Restaurant.exists({ _id: restaurant, ...LIVE_RESTAURANT });
-    if (!found) return fail(res, 404, "Restaurant not found", "RESTAURANT_NOT_FOUND");
-    ref.restaurant = restaurant;
-  } else {
-    if (!AccountService.isObjectId(String(list))) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
-    const found = await FavoriteList.findOne({ _id: list, isDeleted: false });
-    if (!found || !found.canView(req.user._id) || found.privacy === "private") {
-      return fail(res, 400, "Make the list public or collaborative to share it", "LIST_PRIVATE");
-    }
-    ref.list = list;
-  }
-
-  // Only people connected to me (either direction) — no spam to strangers.
-  const following = new Set((req.user.following || []).map(String));
-  const followers = await User.find({ _id: { $in: ids }, following: req.user._id }, "_id").lean();
-  const allowed = new Set([...ids.filter((id) => following.has(id)), ...followers.map((f) => String(f._id))]);
-
-  let sent = 0;
-  for (const recipient of allowed) {
-    const doc = await Notification.notify({ recipient, actor: req.user._id, type: "share", dedupe: false, ...ref });
-    if (doc) sent += 1;
-  }
-  res.json({ success: true, message: "Shared", data: { sent, skipped: ids.length - allowed.size } });
-});
+const shareWithPeople = asyncHandler(async (req, res) =>
+  fail(res, 400, "Sending to people in the app is no longer available. Share the link instead", "SHARE_DISABLED"),
+);
 
 // ============================================================ me: settings
+
+const sameText = (a, b) =>
+  String(a ?? "")
+    .trim()
+    .toLowerCase() ===
+  String(b ?? "")
+    .trim()
+    .toLowerCase();
 
 const BOOLEAN_SETTINGS = ["emailNotifications", "pushNotifications", "followerAlerts", "reservationAlerts"];
 const VISIBILITY_SETTINGS = ["reviewsVisibility", "listsVisibility"];
@@ -823,7 +937,9 @@ const updateSettings = asyncHandler(async (req, res) => {
     user.language = language;
   }
   // Location sheet: the chosen catalog city follows the account.
-  if (city !== undefined) {
+  // An unchanged value is kept as is, even when that city was renamed or
+  // removed from the catalog since (the client re-sends what it got).
+  if (city !== undefined && !sameText(city, user.city)) {
     const resolved = await CatalogService.resolveCity(city || "", { keep: user.city });
     if (resolved.unknown) return fail(res, 400, `Unknown city: ${resolved.unknown}`, "CITY_INVALID");
     user.city = resolved.name;
@@ -862,6 +978,8 @@ const deleteMyAccount = asyncHandler(async (req, res) => {
 
   const result = await AccountService.deleteAccount(user._id, { by: "self" });
   if (!result.deleted) return fail(res, result.status || 400, result.message, "DELETE_FAILED");
+  // Signed out everywhere: open sockets go too (like the admin delete).
+  socketService.disconnectUser(String(user._id));
   res.json({ success: true, message: "Account deleted", data: { summary: result.summary } });
 });
 
@@ -869,6 +987,9 @@ export {
   getProfile,
   followUser,
   unfollowUser,
+  getFollowRequests,
+  acceptFollowRequest,
+  declineFollowRequest,
   removeFollower,
   getFollowers,
   getFollowing,

@@ -80,6 +80,19 @@ const writeRateLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+/**
+ * AI translation (POST /api/admin/translate) — each request is a paid model
+ * call: 30 per minute per admin.
+ */
+const translateRateLimiter = rateLimit({
+  windowMs: 1 * MINUTE,
+  limit: 30,
+  keyGenerator: (req) => `translate:${keyByIdentity(requestIdentity(req), req)}`,
+  message: limitMessage("Too many translation requests. Please wait a minute."),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // Lower-cased email from the body ("" when missing / not a string).
 const bodyEmail = (req) =>
   typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
@@ -108,8 +121,13 @@ const loginEmailLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const loginRateLimiter = (req, res, next) =>
-  loginIpLimiter(req, res, (err) => (err ? next(err) : loginEmailLimiter(req, res, next)));
+// Idempotent per request: app.js runs it before accountStatusGate (so the
+// lockout covers every account, active or not) and AuthRouter runs it again.
+const loginRateLimiter = (req, res, next) => {
+  if (req.loginRateLimited) return next();
+  req.loginRateLimited = true;
+  return loginIpLimiter(req, res, (err) => (err ? next(err) : loginEmailLimiter(req, res, next)));
+};
 
 /**
  * OTP send / verify endpoints (register, resend, forgot-password, verify).
@@ -135,6 +153,21 @@ const otpEmailLimiter = rateLimit({
 
 const otpRateLimiter = (req, res, next) =>
   otpIpLimiter(req, res, (err) => (err ? next(err) : otpEmailLimiter(req, res, next)));
+
+/**
+ * Code guessing across addresses: FAILED verifications (verify-otp /
+ * verify-reset-otp) per IP, whatever e-mail they target — the per-address
+ * budget lives on the OTP itself (OTP_POLICY). 15 failures / hour per IP.
+ */
+const otpVerifyLimiter = rateLimit({
+  windowMs: 60 * MINUTE,
+  limit: 15,
+  skipSuccessfulRequests: true,
+  keyGenerator: (req) => `otp-verify-ip:${ipKey(req)}`,
+  message: limitMessage("Too many invalid codes. Please try again later", "OTP_LOCKED"),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 /**
  * Extra hardening headers (Helmet covers most; these are belt-and-braces).
@@ -177,7 +210,9 @@ export {
   apiRateLimiter,
   loginRateLimiter,
   otpRateLimiter,
+  otpVerifyLimiter,
   writeRateLimiter,
+  translateRateLimiter,
   securityHeaders,
   uploadHeaders,
   noCookies,

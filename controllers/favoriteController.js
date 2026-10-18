@@ -1,6 +1,13 @@
 import { FavoriteList, Restaurant, User, Notification } from "#models";
-import { LIST_NAME_MAX, COLLABORATOR_ROLES } from "#models/favoriteList.model.js";
-import { AccountService } from "#services";
+import {
+  LIST_NAME_MAX,
+  COLLABORATOR_ROLES,
+  LISTS_PER_USER_MAX,
+  LIST_ITEMS_MAX,
+  LIST_COLLABORATORS_MAX,
+} from "#models/favoriteList.model.js";
+import { mongoose } from "#lib";
+import { AccountService, FollowRequestService } from "#services";
 import { asyncHandler } from "#utils";
 import { favoritePrivacy } from "#constants";
 
@@ -8,16 +15,29 @@ import { favoritePrivacy } from "#constants";
  * Favourite lists: the heart ("Saved" default list), the Add-to-list sheet,
  * custom lists, list saves ("32 saved"), collaborators and share links.
  *
- * Access policy (FavoriteList methods): public → anyone views; collaborative →
- * anyone with the link views, joined editors edit; private → owner only.
+ * Access policy (FavoriteList methods + canAccess below): public → anyone
+ * views; collaborative → anyone with the link views, joined editors edit;
+ * private → owner only. Lists of a suspended / banned / deleted owner are
+ * gone for everybody else, and people who are not on the list also need the
+ * owner's listsVisibility (private accounts: accepted followers only) — except
+ * a collaborative list opened through its invite link (only members get it).
+ *
+ * Caps: LISTS_PER_USER_MAX lists, LIST_ITEMS_MAX restaurants per list,
+ * LIST_COLLABORATORS_MAX collaborators (LIST_LIMIT / LIST_ITEMS_LIMIT /
+ * LIST_COLLABORATORS_LIMIT). The default "Saved" list can be renamed and made
+ * public / private, but not deleted, made collaborative or shared with
+ * collaborators (LIST_DEFAULT_LOCKED).
  */
 
 // Restaurants that can still be shown: only public (active, not in Trash) ones —
 // a pending / suspended / rejected / closed restaurant would open as a 404.
 const LIVE_RESTAURANT = { isDeleted: false, status: "active" };
 const CARD_FIELDS =
-  "name slug coverImages rating reviewCount cuisines tags priceLevel avgPrice priceMin priceMax address city location openNow discountPercent saveCount status";
-const PERSON_FIELDS = "firstName lastName avatar verified bio city isPrivate isDeleted status";
+  "name slug coverImages rating reviewCount reviewStats cuisines tags priceLevel avgPrice priceMin priceMax address city location openNow discountPercent saveCount status translations";
+// Owner / collaborator fields (incl. what the access gate needs).
+const PERSON_FIELDS = "firstName lastName avatar verified bio city isPrivate isDeleted status settings.listsVisibility";
+// Mutual restaurants are computed for at most this many people per list.
+const MUTUAL_PEOPLE_MAX = 50;
 
 const fail = (res, status, message, code) => res.status(status).json({ success: false, message, code });
 
@@ -39,39 +59,83 @@ const findLiveRestaurant = async (id) => {
   return Restaurant.findOne({ _id: id, ...LIVE_RESTAURANT }, "_id name");
 };
 
-/** Load a non-deleted list by :id (404 for bad ids / missing). */
+/** Load a non-deleted list by :id (404 for bad ids / missing); the owner is always populated. */
 const loadList = async (id, populate = false) => {
   if (!AccountService.isObjectId(String(id ?? ""))) return null;
-  let query = FavoriteList.findOne({ _id: id, isDeleted: false });
+  let query = FavoriteList.findOne({ _id: id, isDeleted: false }).populate("owner", PERSON_FIELDS);
   if (populate) {
     query = query
       .populate({ path: "items.restaurant", match: LIVE_RESTAURANT, select: CARD_FIELDS })
-      .populate("owner", PERSON_FIELDS)
       .populate("collaborators.user", PERSON_FIELDS)
       .populate("items.addedBy", "firstName lastName avatar");
   }
   return query;
 };
 
-/** Restaurant ids saved by each of `ownerIds` (for "N mutual restaurants"). */
-const savedSetsByOwner = async (ownerIds) => {
-  const ids = [...new Set(ownerIds.map(String))];
-  const lists = await FavoriteList.find(
-    { owner: { $in: ids }, isDeleted: false },
-    "owner items.restaurant",
-  ).lean();
-  const sets = new Map(ids.map((id) => [id, new Set()]));
-  lists.forEach((l) => (l.items || []).forEach((it) => sets.get(String(l.owner))?.add(String(it.restaurant))));
-  return sets;
+/**
+ * May `viewer` open `list` (owner populated)? See the access policy above.
+ * viaLink: opened through the share link (a collaborative list's invite).
+ */
+const canAccess = (list, viewer, { viaLink = false } = {}) => {
+  const viewerId = viewer?._id ? String(viewer._id) : null;
+  if (!list || !list.canView(viewerId)) return false;
+  const role = list.roleOf(viewerId);
+  if (role === "owner") return true;
+  if (!list.owner || typeof list.owner !== "object" || !isLiveUser(list.owner)) return false;
+  if (role) return true;
+  if (viaLink && list.privacy === "collaborative") return true;
+  return AccountService.canSeeLists(viewer, list.owner);
 };
 
-const intersectionSize = (a, b) => {
-  if (!a || !b) return 0;
-  let n = 0;
-  a.forEach((v) => {
-    if (b.has(v)) n += 1;
-  });
-  return n;
+const canEditList = (list, viewer) => canAccess(list, viewer) && list.canEdit(viewer._id);
+
+/** 404 / 403 for a list the viewer can't open (null when they can). */
+const denyAccess = (res, list, viewer) => {
+  if (!list) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
+  if (canAccess(list, viewer)) return null;
+  const isOwner = list.roleOf(viewer?._id) === "owner";
+  if (!isOwner && (!list.owner || !isLiveUser(list.owner))) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
+  return fail(res, 403, "This list is private", "LIST_PRIVATE");
+};
+
+const oid = (value) => new mongoose.Types.ObjectId(String(value));
+
+/**
+ * "N mutual restaurants" with each of `people` (viewer's saved restaurants ∩
+ * theirs), counting only their lists the viewer could open: public /
+ * collaborative lists of people whose lists the viewer may see
+ * (listsVisibility / private account), or lists the viewer is a member of.
+ * → Map userId → count (bounded to MUTUAL_PEOPLE_MAX people).
+ */
+const mutualCounts = async (viewer, people) => {
+  const counts = new Map();
+  const viewerId = viewer?._id ? String(viewer._id) : null;
+  if (!viewerId) return counts;
+  const others = people.filter((u) => u && idOf(u) !== viewerId && isLiveUser(u)).slice(0, MUTUAL_PEOPLE_MAX);
+  if (!others.length) return counts;
+  const mine = [...(await FavoriteList.ownerSavedSet(viewerId))].map(oid);
+  if (!mine.length) return counts;
+  const browsable = others.filter((u) => AccountService.canSeeLists(viewer, u)).map((u) => oid(idOf(u)));
+  const shown = { $in: ["public", "collaborative"] };
+  const rows = await FavoriteList.aggregate([
+    {
+      $match: {
+        isDeleted: false,
+        privacy: shown,
+        "items.restaurant": { $in: mine },
+        $or: [
+          { owner: { $in: browsable } },
+          { owner: { $in: others.map((u) => oid(idOf(u))) }, "collaborators.user": oid(viewerId) },
+        ],
+      },
+    },
+    { $unwind: "$items" },
+    { $match: { "items.restaurant": { $in: mine } } },
+    { $group: { _id: "$owner", restaurants: { $addToSet: "$items.restaurant" } } },
+    { $project: { count: { $size: "$restaurants" } } },
+  ]);
+  rows.forEach((r) => counts.set(String(r._id), r.count));
+  return counts;
 };
 
 /** Compact list row (Favorites index, profile, Add-to-list sheet). */
@@ -84,14 +148,17 @@ const detail = async (list, viewer) => {
   const following = new Set((viewer?.following || []).map(String));
 
   const collaborators = (list.collaborators || []).filter((c) => isLiveUser(c.user));
-  const people = [idOf(list.owner), ...collaborators.map((c) => idOf(c.user))];
-  const sets = viewerId ? await savedSetsByOwner([viewerId, ...people]) : new Map();
-  const mine = viewerId ? sets.get(viewerId) : null;
+  const people = [list.owner, ...collaborators.map((c) => c.user)].filter((u) => u && typeof u === "object");
+  const [mutual, statuses] = await Promise.all([
+    mutualCounts(viewer, people),
+    viewerId ? FollowRequestService.statusMap(viewer, people) : new Map(),
+  ]);
   const person = (u) => ({
     ...AccountService.publicUser(u),
     isMe: idOf(u) === viewerId,
     isFollowing: following.has(idOf(u)),
-    mutualCount: idOf(u) === viewerId ? 0 : intersectionSize(mine, sets.get(idOf(u))),
+    followStatus: idOf(u) === viewerId ? "none" : statuses.get(idOf(u)) || "none",
+    mutualCount: idOf(u) === viewerId ? 0 : mutual.get(idOf(u)) || 0,
   });
 
   const items = (list.items || [])
@@ -119,19 +186,24 @@ const detail = async (list, viewer) => {
   };
 };
 
-/** Lists the user may add to / remove from (own + editor collaborations). */
-const editableLists = async (userId) => {
-  const lists = await FavoriteList.find({
-    isDeleted: false,
-    $or: [{ owner: userId }, { "collaborators.user": userId }],
-  });
-  return lists.filter((l) => l.canEdit(userId));
+/** Lists the user may add to / remove from (own + editor collaborations of live owners). */
+const editableLists = async (viewer, select = undefined) => {
+  const lists = await FavoriteList.find(
+    { isDeleted: false, $or: [{ owner: viewer._id }, { "collaborators.user": viewer._id }] },
+    select,
+  ).populate("owner", PERSON_FIELDS);
+  return lists.filter((l) => canEditList(l, viewer));
 };
 
-// Atomic item add / remove (no duplicates under double taps).
+// Atomic item add / remove (no duplicates under double taps, never past the cap).
 const pushItem = (listId, restaurantId, userId) =>
   FavoriteList.updateOne(
-    { _id: listId, isDeleted: false, "items.restaurant": { $ne: restaurantId } },
+    {
+      _id: listId,
+      isDeleted: false,
+      "items.restaurant": { $ne: restaurantId },
+      [`items.${LIST_ITEMS_MAX - 1}`]: { $exists: false },
+    },
     { $push: { items: { restaurant: restaurantId, savedAt: new Date(), addedBy: userId } } },
   );
 // Filters on presence: with timestamps a no-op $pull would still count as modified.
@@ -140,6 +212,32 @@ const pullItem = (listId, restaurantId) =>
     { _id: listId, isDeleted: false, "items.restaurant": restaurantId },
     { $pull: { items: { restaurant: restaurantId } } },
   );
+
+/**
+ * Add a restaurant to a list and keep Restaurant.saveCount right from the
+ * write's own result. → "added" | "exists" | "full"
+ */
+const addToList = async (list, restaurantId, userId) => {
+  const result = await pushItem(list._id, restaurantId, userId);
+  if (result.modifiedCount) {
+    await FavoriteList.afterItemsAdded(idOf(list.owner), list._id, [restaurantId]);
+    return "added";
+  }
+  const has = await FavoriteList.exists({ _id: list._id, "items.restaurant": restaurantId });
+  return has ? "exists" : "full";
+};
+
+/** Remove a restaurant from a list (saveCount from the write's result). → true when removed */
+const removeFromList = async (list, restaurantId) => {
+  const result = await pullItem(list._id, restaurantId);
+  if (!result.modifiedCount) return false;
+  await FavoriteList.afterItemsRemoved(idOf(list.owner), [list._id], [restaurantId]);
+  return true;
+};
+
+const itemsFull = (res) =>
+  fail(res, 400, `A list can hold at most ${LIST_ITEMS_MAX} restaurants`, "LIST_ITEMS_LIMIT");
+const defaultLocked = (res, message) => fail(res, 400, message, "LIST_DEFAULT_LOCKED");
 
 const listHas = (list, restaurantId) => (list.items || []).some((it) => idOf(it.restaurant) === String(restaurantId));
 
@@ -157,14 +255,14 @@ const listMyLists = asyncHandler(async (req, res) => {
     isDeleted: false,
     $or: [{ owner: uid }, { "collaborators.user": uid }],
   })
-    .populate({ path: "items.restaurant", match: LIVE_RESTAURANT, select: "coverImages name" })
+    .populate({ path: "items.restaurant", match: LIVE_RESTAURANT, select: "coverImages name translations" })
     .populate("collaborators.user", "firstName lastName avatar isDeleted status")
     .populate("owner", PERSON_FIELDS);
 
   const restaurantId = AccountService.isObjectId(String(req.query.restaurant ?? "")) ? String(req.query.restaurant) : null;
 
   const shaped = lists
-    .filter((l) => l.canView(uid))
+    .filter((l) => canAccess(l, req.user))
     .sort((a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0) || new Date(b.updatedAt) - new Date(a.updatedAt))
     .map((l) => {
       const row = summarize(l, uid);
@@ -183,9 +281,9 @@ const listSavedLists = asyncHandler(async (req, res) => {
   const uid = req.user._id;
   const lists = await FavoriteList.find({ isDeleted: false, followers: uid })
     .sort({ updatedAt: -1 })
-    .populate({ path: "items.restaurant", match: LIVE_RESTAURANT, select: "coverImages name" })
+    .populate({ path: "items.restaurant", match: LIVE_RESTAURANT, select: "coverImages name translations" })
     .populate("owner", PERSON_FIELDS);
-  const shaped = lists.filter((l) => l.canView(uid) && isLiveUser(l.owner)).map((l) => summarize(l, uid));
+  const shaped = lists.filter((l) => canAccess(l, req.user)).map((l) => summarize(l, uid));
   res.json({ success: true, data: { lists: shaped } });
 });
 
@@ -206,20 +304,22 @@ const createList = asyncHandler(async (req, res) => {
     target = await findLiveRestaurant(restaurant);
     if (!target) return fail(res, 404, "Restaurant not found", "RESTAURANT_NOT_FOUND");
   }
+  if ((await FavoriteList.countDocuments({ owner: req.user._id, isDeleted: false })) >= LISTS_PER_USER_MAX) {
+    return fail(res, 400, `You can have at most ${LISTS_PER_USER_MAX} lists`, "LIST_LIMIT");
+  }
 
-  const list = await FavoriteList.trackSaves(req.user._id, target ? [target._id] : [], () =>
-    FavoriteList.create({
-      name,
-      privacy,
-      owner: req.user._id,
-      items: target ? [{ restaurant: target._id, addedBy: req.user._id }] : [],
-    }),
-  );
+  const list = await FavoriteList.create({
+    name,
+    privacy,
+    owner: req.user._id,
+    items: target ? [{ restaurant: target._id, addedBy: req.user._id }] : [],
+  });
+  if (target) await FavoriteList.afterItemsAdded(req.user._id, list._id, [target._id]);
 
   const fresh = await FavoriteList.findById(list._id).populate({
     path: "items.restaurant",
     match: LIVE_RESTAURANT,
-    select: "coverImages name",
+    select: "coverImages name translations",
   });
   res.status(201).json({ success: true, message: "List created", data: { list: summarize(fresh, req.user._id) } });
 });
@@ -230,8 +330,8 @@ const createList = asyncHandler(async (req, res) => {
  */
 const getList = asyncHandler(async (req, res) => {
   const list = await loadList(req.params.id, true);
-  if (!list) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
-  if (!list.canView(req.user._id)) return fail(res, 403, "This list is private", "LIST_PRIVATE");
+  const denied = denyAccess(res, list, req.user);
+  if (denied) return denied;
 
   const payload = await detail(list, req.user);
   res.json({
@@ -269,6 +369,12 @@ const updateList = asyncHandler(async (req, res) => {
     if (!favoritePrivacy.includes(privacy)) {
       return fail(res, 400, `Privacy must be one of: ${favoritePrivacy.join(", ")}`, "LIST_PRIVACY_INVALID");
     }
+    if (list.isDefault && privacy === "collaborative") {
+      return defaultLocked(res, "The Saved list can be public or private, not collaborative");
+    }
+    // A collaborative link makes its holder an editor: links handed out while
+    // the list was public / private stop working.
+    if (privacy === "collaborative" && list.privacy !== "collaborative") list.shareSlug = undefined;
     if (privacy === "private" && list.privacy !== "private") {
       lostAccess = new Set([
         ...(list.collaborators || []).map((c) => idOf(c.user)),
@@ -297,11 +403,14 @@ const deleteList = asyncHandler(async (req, res) => {
   if (!list.canManage(req.user._id)) {
     return fail(res, 403, "Only the owner can delete this list", "LIST_FORBIDDEN");
   }
+  if (list.isDefault) return defaultLocked(res, "The Saved list can't be deleted");
 
   const restaurantIds = (list.items || []).map((it) => String(it.restaurant));
-  await FavoriteList.trackSaves(list.owner, restaurantIds, () =>
-    FavoriteList.updateOne({ _id: list._id }, { $set: { isDeleted: true, deletedAt: new Date() } }),
+  const result = await FavoriteList.updateOne(
+    { _id: list._id, isDeleted: false },
+    { $set: { isDeleted: true, deletedAt: new Date() } },
   );
+  if (result.modifiedCount) await FavoriteList.afterItemsRemoved(idOf(list.owner), [list._id], restaurantIds);
   await Notification.retract({ list: list._id });
 
   res.json({ success: true, message: "List deleted", data: { listId: list._id, wasDefault: !!list.isDefault } });
@@ -315,20 +424,22 @@ const deleteList = asyncHandler(async (req, res) => {
  */
 const addItem = asyncHandler(async (req, res) => {
   const list = await loadList(req.params.id);
-  if (!list) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
+  if (!list || !canAccess(list, req.user)) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
   if (!list.canEdit(req.user._id)) return fail(res, 403, "You cannot edit this list", "LIST_FORBIDDEN");
 
   const restaurant = await findLiveRestaurant(req.body?.restaurant);
   if (!restaurant) return fail(res, 404, "Restaurant not found", "RESTAURANT_NOT_FOUND");
 
-  const result = await FavoriteList.trackSaves(list.owner, [restaurant._id], () =>
-    pushItem(list._id, restaurant._id, req.user._id),
-  );
-  const fresh = await FavoriteList.findById(list._id, "items updatedAt").lean();
+  const outcome = await addToList(list, restaurant._id, req.user._id);
+  if (outcome === "full") return itemsFull(res);
+  const [itemCount, fresh] = await Promise.all([
+    FavoriteList.liveItemCount(list._id),
+    FavoriteList.findById(list._id, "updatedAt").lean(),
+  ]);
   res.json({
     success: true,
-    message: result.modifiedCount ? "Added to list" : "Already in this list",
-    data: { listId: list._id, added: !!result.modifiedCount, itemCount: fresh.items.length, updatedAt: fresh.updatedAt },
+    message: outcome === "added" ? "Added to list" : "Already in this list",
+    data: { listId: list._id, added: outcome === "added", itemCount, updatedAt: fresh.updatedAt },
   });
 });
 
@@ -338,17 +449,20 @@ const addItem = asyncHandler(async (req, res) => {
  */
 const removeItem = asyncHandler(async (req, res) => {
   const list = await loadList(req.params.id);
-  if (!list) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
+  if (!list || !canAccess(list, req.user)) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
   if (!list.canEdit(req.user._id)) return fail(res, 403, "You cannot edit this list", "LIST_FORBIDDEN");
   const rid = req.params.restaurantId;
   if (!AccountService.isObjectId(rid)) return fail(res, 400, "Invalid restaurant id", "RESTAURANT_INVALID");
 
-  const result = await FavoriteList.trackSaves(list.owner, [rid], () => pullItem(list._id, rid));
-  const fresh = await FavoriteList.findById(list._id, "items updatedAt").lean();
+  const removed = await removeFromList(list, rid);
+  const [itemCount, fresh] = await Promise.all([
+    FavoriteList.liveItemCount(list._id),
+    FavoriteList.findById(list._id, "updatedAt").lean(),
+  ]);
   res.json({
     success: true,
-    message: result.modifiedCount ? "Removed from list" : "Not in this list",
-    data: { listId: list._id, removed: !!result.modifiedCount, itemCount: fresh.items.length, updatedAt: fresh.updatedAt },
+    message: removed ? "Removed from list" : "Not in this list",
+    data: { listId: list._id, removed, itemCount, updatedAt: fresh.updatedAt },
   });
 });
 
@@ -368,7 +482,11 @@ const toggleFavorite = asyncHandler(async (req, res) => {
     return fail(res, 404, "Restaurant not found", "RESTAURANT_NOT_FOUND");
   }
 
-  await FavoriteList.trackSaves(uid, [rid], () => (inList ? pullItem(list._id, rid) : pushItem(list._id, rid, uid)));
+  if (inList) {
+    await removeFromList(list, rid);
+  } else if ((await addToList(list, rid, uid)) === "full") {
+    return itemsFull(res);
+  }
 
   const lists = await FavoriteList.find({ owner: uid, isDeleted: false, "items.restaurant": rid }, "_id").lean();
   res.json({
@@ -391,16 +509,11 @@ const toggleFavorite = asyncHandler(async (req, res) => {
  */
 const getSavedIds = asyncHandler(async (req, res) => {
   const uid = req.user._id;
-  const lists = await FavoriteList.find(
-    { isDeleted: false, $or: [{ owner: uid }, { "collaborators.user": uid }] },
-    "owner privacy collaborators isDefault items.restaurant",
-  );
+  const lists = await editableLists(req.user, "owner privacy collaborators isDefault items.restaurant");
   const byRestaurant = {};
   const defaultIds = [];
   let defaultListId = null;
-  lists
-    .filter((l) => l.canEdit(uid))
-    .forEach((l) => {
+  lists.forEach((l) => {
       const mineDefault = l.isDefault && idOf(l.owner) === String(uid);
       if (mineDefault) defaultListId = l._id;
       l.items.forEach((it) => {
@@ -408,7 +521,7 @@ const getSavedIds = asyncHandler(async (req, res) => {
         (byRestaurant[rid] ||= []).push(l._id);
         if (mineDefault) defaultIds.push(rid);
       });
-    });
+  });
   res.json({
     success: true,
     data: {
@@ -431,12 +544,11 @@ const getMembership = asyncHandler(async (req, res) => {
   const uid = req.user._id;
   await FavoriteList.ensureDefault(uid);
 
-  const lists = (await editableLists(uid)).sort(
+  const lists = (await editableLists(req.user)).sort(
     (a, b) => (b.isDefault ? 1 : 0) - (a.isDefault ? 1 : 0) || new Date(b.updatedAt) - new Date(a.updatedAt),
   );
   await FavoriteList.populate(lists, [
-    { path: "items.restaurant", match: LIVE_RESTAURANT, select: "coverImages name" },
-    { path: "owner", select: PERSON_FIELDS },
+    { path: "items.restaurant", match: LIVE_RESTAURANT, select: "coverImages name translations" },
   ]);
   const rows = lists.map((l) => ({ ...summarize(l, uid), contains: listHas(l, rid) }));
   res.json({
@@ -465,7 +577,7 @@ const setMembership = asyncHandler(async (req, res) => {
   const wantedIds = new Set(wanted.map(String));
   const uid = req.user._id;
 
-  const lists = await editableLists(uid);
+  const lists = await editableLists(req.user);
   const editableIds = new Set(lists.map((l) => String(l._id)));
   const unknown = [...wantedIds].filter((id) => !editableIds.has(id));
   if (unknown.length) return fail(res, 403, "You cannot edit one or more of these lists", "LIST_FORBIDDEN");
@@ -475,17 +587,11 @@ const setMembership = asyncHandler(async (req, res) => {
   if (adding.length && !(await findLiveRestaurant(rid))) {
     return fail(res, 404, "Restaurant not found", "RESTAURANT_NOT_FOUND");
   }
+  if (adding.some((l) => (l.items || []).length >= LIST_ITEMS_MAX)) return itemsFull(res);
 
-  // saveCount is per list owner — group the changes by owner.
-  const owners = new Set([...adding, ...removing].map((l) => idOf(l.owner)));
-  for (const owner of owners) {
-    await FavoriteList.trackSaves(owner, [rid], () =>
-      Promise.all([
-        ...adding.filter((l) => idOf(l.owner) === owner).map((l) => pushItem(l._id, rid, uid)),
-        ...removing.filter((l) => idOf(l.owner) === owner).map((l) => pullItem(l._id, rid)),
-      ]),
-    );
-  }
+  // One write at a time: each saveCount change follows its own write result.
+  for (const l of adding) await addToList(l, rid, uid);
+  for (const l of removing) await removeFromList(l, rid);
 
   const now = await FavoriteList.find(
     { _id: { $in: [...editableIds] }, isDeleted: false, "items.restaurant": rid },
@@ -513,8 +619,8 @@ const setMembership = asyncHandler(async (req, res) => {
  */
 const followList = asyncHandler(async (req, res) => {
   const list = await loadList(req.params.id);
-  if (!list) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
-  if (!list.canView(req.user._id)) return fail(res, 403, "This list is private", "LIST_PRIVATE");
+  const denied = denyAccess(res, list, req.user);
+  if (denied) return denied;
   if (list.canManage(req.user._id)) return fail(res, 400, "This is your own list", "LIST_OWN");
 
   const result = await FavoriteList.updateOne(
@@ -523,7 +629,7 @@ const followList = asyncHandler(async (req, res) => {
     { timestamps: false },
   );
   if (result.modifiedCount) {
-    Notification.notify({ recipient: list.owner, actor: req.user._id, type: "list_save", list: list._id }).catch(
+    Notification.notify({ recipient: idOf(list.owner), actor: req.user._id, type: "list_save", list: list._id }).catch(
       () => {},
     );
   }
@@ -559,8 +665,8 @@ const unfollowList = asyncHandler(async (req, res) => {
  */
 const getCollaborators = asyncHandler(async (req, res) => {
   const list = await loadList(req.params.id, true);
-  if (!list) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
-  if (!list.canView(req.user._id)) return fail(res, 403, "This list is private", "LIST_PRIVATE");
+  const denied = denyAccess(res, list, req.user);
+  if (denied) return denied;
   const payload = await detail(list, req.user);
   res.json({
     success: true,
@@ -582,6 +688,7 @@ const addCollaborator = asyncHandler(async (req, res) => {
   const list = await loadList(req.params.id);
   if (!list) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
   if (!list.canManage(req.user._id)) return fail(res, 403, "Only the owner can manage users", "LIST_FORBIDDEN");
+  if (list.isDefault) return defaultLocked(res, "The Saved list can't have collaborators");
   if (list.privacy === "private") {
     return fail(res, 400, "Make the list collaborative or public to share it", "LIST_PRIVATE");
   }
@@ -598,6 +705,8 @@ const addCollaborator = asyncHandler(async (req, res) => {
   const existing = list.collaborators.find((c) => idOf(c.user) === String(userId));
   if (existing) {
     existing.role = role;
+  } else if (list.collaborators.length >= LIST_COLLABORATORS_MAX) {
+    return collaboratorsFull(res);
   } else {
     list.collaborators.push({ user: user._id, role, addedBy: req.user._id });
   }
@@ -667,6 +776,9 @@ const removeCollaborator = asyncHandler(async (req, res) => {
 
 // ============================================================ share link
 
+const collaboratorsFull = (res) =>
+  fail(res, 400, `A list can have at most ${LIST_COLLABORATORS_MAX} collaborators`, "LIST_COLLABORATORS_LIMIT");
+
 /**
  * Open a shared list by its slug (share link / deep link). Guests allowed.
  * GET /api/favorites/share/:slug
@@ -675,10 +787,9 @@ const getSharedList = asyncHandler(async (req, res) => {
   const slug = String(req.params.slug || "").slice(0, 120);
   const found = await FavoriteList.findOne({ shareSlug: slug, isDeleted: false }, "_id");
   const list = found ? await loadList(found._id, true) : null;
-  const viewerId = req.user?._id || null;
-  // Private lists look like missing ones to everybody but the owner.
-  if (!list || !list.canView(viewerId)) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
-  if (!isLiveUser(list.owner)) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
+  // Lists the viewer can't open look like missing ones (private lists to
+  // everybody but the owner).
+  if (!canAccess(list, req.user || null, { viaLink: true })) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
 
   const payload = await detail(list, req.user || null);
   res.json({
@@ -700,19 +811,26 @@ const getSharedList = asyncHandler(async (req, res) => {
  */
 const joinSharedList = asyncHandler(async (req, res) => {
   const slug = String(req.params.slug || "").slice(0, 120);
-  const list = await FavoriteList.findOne({ shareSlug: slug, isDeleted: false });
+  const list = await FavoriteList.findOne({ shareSlug: slug, isDeleted: false }).populate("owner", PERSON_FIELDS);
   if (!list || list.privacy === "private") return fail(res, 404, "List not found", "LIST_NOT_FOUND");
   const uid = req.user._id;
   if (list.canManage(uid)) return fail(res, 400, "This is your own list", "LIST_OWN");
+  if (!canAccess(list, req.user, { viaLink: true })) return fail(res, 404, "List not found", "LIST_NOT_FOUND");
 
-  let role = list.roleOf(uid);
+  const role = list.roleOf(uid);
   if (list.privacy === "collaborative") {
     if (!role) {
-      await FavoriteList.updateOne(
-        { _id: list._id, "collaborators.user": { $ne: uid } },
+      const joined = await FavoriteList.updateOne(
+        {
+          _id: list._id,
+          "collaborators.user": { $ne: uid },
+          [`collaborators.${LIST_COLLABORATORS_MAX - 1}`]: { $exists: false },
+        },
         { $push: { collaborators: { user: uid, role: "editor", addedBy: null, addedAt: new Date() } } },
       );
-      role = "editor";
+      if (!joined.modifiedCount && !(await FavoriteList.exists({ _id: list._id, "collaborators.user": uid }))) {
+        return collaboratorsFull(res);
+      }
     }
   } else {
     const result = await FavoriteList.updateOne(
@@ -721,7 +839,9 @@ const joinSharedList = asyncHandler(async (req, res) => {
       { timestamps: false },
     );
     if (result.modifiedCount) {
-      Notification.notify({ recipient: list.owner, actor: uid, type: "list_save", list: list._id }).catch(() => {});
+      Notification.notify({ recipient: idOf(list.owner), actor: uid, type: "list_save", list: list._id }).catch(
+        () => {},
+      );
     }
   }
 

@@ -21,6 +21,9 @@ import {
   LinkPreviewService,
 } from "#services";
 
+// Models (boot self-heal)
+import { FavoriteList } from "#models";
+
 // Middlewares
 import {
   noCookies,
@@ -28,6 +31,7 @@ import {
   securityHeaders,
   uploadHeaders,
   sanitizeInput,
+  keepRawBodyField,
   maintenanceGate,
   accountStatusGate,
   newAccountPolicy,
@@ -37,6 +41,10 @@ import {
   localize,
   apiVersionAlias,
   appVersionGate,
+  authenticate,
+  requireRole,
+  loginRateLimiter,
+  otpVerifyLimiter,
 } from "#middlewares";
 
 // Routes
@@ -124,6 +132,11 @@ const setupMiddlewares = (app) => {
     express.urlencoded({ extended: true, limit: securityConfig.maxPayloadSize }),
   );
 
+  // AI translation keys are opaque field paths ("sections.2.body") the
+  // sanitizer would drop: keep a raw copy of `texts` (strings only, validated by
+  // the translate handler, never used in a query).
+  app.post("/api/admin/translate", keepRawBodyField("texts"));
+
   // NoSQL injection sanitization
   app.use(sanitizeInput);
 
@@ -137,23 +150,29 @@ const setupMiddlewares = (app) => {
   app.use("/api", appVersionGate);
 
   // Multipart parsing only where files are accepted, after the rate limiter,
-  // with hard limits on file / part counts. Add new multipart routes here.
-  app.use(
-    ["/api/uploads", "/api/auth/avatar", "/api/admin/menu/uploads", "/api/admin/restaurants/:id/menu-photos"],
-    fileUpload({
-      limits: {
-        fileSize: securityConfig.maxFileSize,
-        files: securityConfig.maxUploadFiles,
-        parts: securityConfig.maxUploadParts,
-      },
-      abortOnLimit: true,
-      // Raw body (written by express-fileupload), kept in the JSON envelope.
-      responseOnLimit: JSON.stringify({
-        success: false,
-        message: "File size limit exceeded (max 10MB)",
-        code: "FILE_TOO_LARGE",
-      }),
+  // with hard limits on file / part counts, and only for an authenticated
+  // caller (admins for the admin routes): anonymous requests are refused
+  // before any upload is buffered. Add new multipart routes here.
+  const multipart = fileUpload({
+    limits: {
+      fileSize: securityConfig.maxFileSize,
+      files: securityConfig.maxUploadFiles,
+      parts: securityConfig.maxUploadParts,
+    },
+    abortOnLimit: true,
+    // Raw body (written by express-fileupload), kept in the JSON envelope.
+    responseOnLimit: JSON.stringify({
+      success: false,
+      message: "File size limit exceeded (max 10MB)",
+      code: "FILE_TOO_LARGE",
     }),
+  });
+  app.use(["/api/uploads", "/api/auth/avatar"], authenticate, multipart, sanitizeInput);
+  app.use(
+    ["/api/admin/menu/uploads", "/api/admin/restaurants/:id/menu-photos"],
+    authenticate,
+    requireRole(["admin"]),
+    multipart,
     sanitizeInput,
   );
 
@@ -166,8 +185,12 @@ const setupMiddlewares = (app) => {
  */
 const setupRoutes = (app) => {
   // Admin Settings policies around routes owned by other modules
-  // (account approval / status, restaurant approval).
-  app.post("/api/auth/login", accountStatusGate);
+  // (account approval / status, restaurant approval). The login limiter runs
+  // first so the brute-force lockout also covers pending / suspended / banned
+  // accounts (the gate checks their password); AuthRouter's copy is a no-op.
+  app.post("/api/auth/login", loginRateLimiter, accountStatusGate);
+  // Code guessing across e-mail addresses: failed verifications per IP.
+  app.post(["/api/auth/verify-otp", "/api/auth/verify-reset-otp"], otpVerifyLimiter);
   app.use("/api/auth", newAccountPolicy);
   app.post(["/api/restaurants", "/api/admin/restaurants"], restaurantApprovalGate);
 
@@ -292,6 +315,10 @@ const validateEnv = () => {
     .filter(([key, defaultVal]) => !process.env[key] || process.env[key] === defaultVal)
     .map(([key]) => key);
 
+  // One key for both token kinds would let a refresh token pass as an access token.
+  if (process.env.ACCESS_SECRET_KEY && process.env.ACCESS_SECRET_KEY === process.env.REFRESH_SECRET_KEY) {
+    missing.push("REFRESH_SECRET_KEY (must differ from ACCESS_SECRET_KEY)");
+  }
   if (!process.env.MONGODB_URI) missing.push("MONGODB_URI");
   // Opt-in: refuse to start without SMTP (sign-up / reset e-mails would 503).
   if (process.env.REQUIRE_SMTP === "true" && (!process.env.SMTP_USER || !process.env.SMTP_PASS)) {
@@ -339,8 +366,8 @@ const initializeServices = async () => {
   // Rolling restaurant activity stats ("Top this week", trending sorts).
   RestaurantStatsService.start();
 
-  // Review migrations (live-only unique index, statuses, numbers, derived
-  // ratings) + orphaned review-photo cleanup.
+  // Review migrations (drop the old one-review-per-place unique index,
+  // statuses, numbers, derived ratings + reviewStats) + orphaned review-photo cleanup.
   try {
     await ReviewService.bootstrap();
   } catch (error) {
@@ -356,6 +383,16 @@ const initializeServices = async () => {
     }
   } catch (error) {
     console.error("❌ Error reconciling restaurant follows:", error.message);
+  }
+
+  // Restaurant.saveCount / list saveCount drift (self-heal, only drifted docs are written).
+  try {
+    const saves = await FavoriteList.reconcileSaveCounts();
+    if (saves.restaurants || saves.lists) {
+      console.log(`✅ Save counts reconciled (${saves.restaurants} restaurants, ${saves.lists} lists fixed)`);
+    }
+  } catch (error) {
+    console.error("❌ Error reconciling save counts:", error.message);
   }
 
   // Lift temporary suspensions when they end.

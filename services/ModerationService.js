@@ -13,11 +13,14 @@ import {
 import { accountStatus, userRoles, restaurantStatus } from "#constants";
 import { baseTemplate, escapeHtml } from "#templates";
 import { httpError } from "#utils";
+import { emailCopy, fill, systemNotificationText } from "#i18n/index.js";
 import { MailService } from "./MailService.js";
 import { ReviewService } from "./ReviewService.js";
 import { UploadSweepService } from "./UploadSweepService.js";
 import { RestaurantFollowService } from "./RestaurantFollowService.js";
+import { FollowRequestService } from "./FollowRequestService.js";
 import socketService from "./SocketService.js";
+import { AuthTokenService } from "./AuthTokenService.js";
 
 /**
  * ModerationService — admin actions on users and restaurants (Users page:
@@ -43,13 +46,18 @@ const idStr = (value) => (value ? String(value._id ?? value) : "");
 const cleanReason = (value) =>
   typeof value === "string" ? value.trim().replace(/\s+/g, " ").slice(0, MAX_REASON) : "";
 
-const formatDate = (date) =>
-  new Date(date).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
-
-/** Fire-and-forget account e-mail (skipped when SMTP is not configured). */
-const mailUser = (user, title, lines) => {
+/**
+ * Fire-and-forget account e-mail of a notice (`copy` = { key, values }, see
+ * NOTIFICATION_COPY.system) in the user's language; skipped when SMTP is not
+ * configured.
+ */
+const mailUser = (user, copy) => {
   if (!user?.email || !MailService.isConfigured?.()) return;
-  const content = lines
+  const text = systemNotificationText(copy, user.language);
+  if (!text) return;
+  const { title } = text;
+  const greeting = fill(emailCopy(user.language).followerGreeting, { name: user.firstName ? ` ${user.firstName}` : "" });
+  const content = [greeting, text.message]
     .filter(Boolean)
     .map((line) => `<p style="margin: 0 0 12px; font-size: 15px; line-height: 1.5;">${escapeHtml(line)}</p>`)
     .join("");
@@ -65,33 +73,22 @@ const recomputeRatingsFor = (userId) =>
     console.error("Rating recompute failed:", error.message),
   );
 
-/** In-app "system" notification (Notification.notify never throws). */
-const notifyUser = (user, actor, { title, message, data = {} }) =>
-  Notification.notify({ recipient: user._id, actor, type: "system", title, message, data });
+/**
+ * In-app "system" notification (Notification.notify never throws). `copy` =
+ * { key, values } is rendered in the reader's language (English stored too).
+ */
+const notifyUser = (user, actor, copy, data = {}) =>
+  Notification.notify({ recipient: user._id, actor, type: "system", copy, data });
 
-// Copy the user sees for each status change.
+// Notice key + values the user gets for each status change.
 const STATUS_COPY = {
-  banned: (reason) => ({
-    title: "Your account has been banned",
-    message: reason ? `Your Yumio account has been banned. Reason: ${reason}` : "Your Yumio account has been banned.",
-  }),
+  banned: (reason) => ({ key: "account_banned", values: { reason } }),
   suspended: (reason, until) => ({
-    title: "Your account has been suspended",
-    message: [
-      until ? `Your Yumio account is suspended until ${formatDate(until)}.` : "Your Yumio account has been suspended.",
-      reason ? `Reason: ${reason}` : "",
-    ]
-      .filter(Boolean)
-      .join(" "),
+    key: "account_suspended",
+    values: { reason, until: until ? new Date(until).toISOString() : null },
   }),
-  restored: () => ({
-    title: "Your account has been restored",
-    message: "Your Yumio account is active again. Welcome back!",
-  }),
-  approved: () => ({
-    title: "Your account has been approved",
-    message: "Your Yumio account has been approved. You can now sign in.",
-  }),
+  restored: () => ({ key: "account_restored" }),
+  approved: () => ({ key: "account_approved" }),
 };
 
 class ModerationService {
@@ -179,6 +176,10 @@ class ModerationService {
     const { status } = user;
     if (status === previous) return;
     if (status === "active" || previous === "active") recomputeRatingsFor(user._id);
+    // Leaving "active" (incl. → pending): refresh families, push tokens and
+    // sockets go too (tokenVersion was bumped in setStatus). Async: the
+    // account:status event below still goes out before the sockets close.
+    if (previous === "active") AuthTokenService.revokeAll(user._id, { bump: false }).catch(() => {});
 
     if (status === "banned" || status === "suspended") {
       const copy = STATUS_COPY[status](user.statusReason, user.suspendedUntil);
@@ -188,14 +189,21 @@ class ModerationService {
         until: user.suspendedUntil,
       });
       socketService.disconnectUser(idStr(user));
-      mailUser(user, copy.title, [`Hi ${user.firstName},`, copy.message]);
+      mailUser(user, copy);
+      // A ban ends the account's pending follow requests both ways (suspended
+      // accounts' requests are just hidden until they are restored).
+      if (status === "banned") {
+        FollowRequestService.removeUser(user._id).catch((error) =>
+          console.error("Follow request cleanup failed:", error.message),
+        );
+      }
       return;
     }
 
     if (status === "active") {
       const copy = previous === "pending" ? STATUS_COPY.approved() : STATUS_COPY.restored();
       notifyUser(user, actor?._id, copy).catch(() => {});
-      mailUser(user, copy.title, [`Hi ${user.firstName},`, copy.message]);
+      mailUser(user, copy);
     }
   }
 
@@ -208,11 +216,11 @@ class ModerationService {
     user.warnings.push({ reason: text, by: actor?._id || null, createdAt: new Date() });
     await user.save();
 
-    const title = "You received a warning";
-    const message = `The Yumio team issued you a warning: ${text}`;
-    await notifyUser(user, actor?._id, { title, message, data: { kind: "warning" } });
+    const copy = { key: "warning", values: { reason: text } };
+    await notifyUser(user, actor?._id, copy, { kind: "warning" });
+    const { title, message } = systemNotificationText(copy, user.language);
     socketService.emitToUser(idStr(user), "notification:new", { type: "system", title, message });
-    mailUser(user, title, [`Hi ${user.firstName},`, message]);
+    mailUser(user, copy);
     return user;
   }
 
@@ -233,6 +241,9 @@ class ModerationService {
     user.role = role;
     user.tokenVersion += 1; // the role is inside the access token
     await user.save();
+    // Refresh families, push tokens and live sockets too (a demoted admin
+    // leaves the `admins` room now, not when the access token expires).
+    await AuthTokenService.revokeAll(user._id, { bump: false });
     return user;
   }
 
@@ -263,10 +274,7 @@ class ModerationService {
     recomputeRatingsFor(userId);
     const user = await User.findById(userId).select("firstName email");
     if (user) {
-      notifyUser(user, null, {
-        title: "Your suspension has ended",
-        message: "Your Yumio account is active again.",
-      }).catch(() => {});
+      notifyUser(user, null, { key: "suspension_ended" }).catch(() => {});
     }
     return true;
   }
@@ -352,18 +360,15 @@ class ModerationService {
     if (restaurant.createdBy && previous !== status && idStr(restaurant.createdBy) !== idStr(actor)) {
       const submitter = await User.findById(restaurant.createdBy).select("role");
       if (submitter && submitter.role !== "admin") {
-        const messages = {
-          active: `${restaurant.name} is now live on Yumio.`,
-          rejected: `${restaurant.name} was not approved.${restaurant.statusReason ? ` Reason: ${restaurant.statusReason}` : ""}`,
-          suspended: `${restaurant.name} has been suspended.${restaurant.statusReason ? ` Reason: ${restaurant.statusReason}` : ""}`,
-        };
-        if (messages[status]) {
+        if (["active", "rejected", "suspended"].includes(status)) {
           Notification.notify({
             recipient: submitter._id,
             actor: actor?._id,
             type: "system",
-            title: "Restaurant listing update",
-            message: messages[status],
+            copy: {
+              key: `restaurant_${status}`,
+              values: { restaurant: restaurant.name, reason: restaurant.statusReason || "" },
+            },
             restaurant: restaurant._id,
           }).catch(() => {});
         }
@@ -414,13 +419,12 @@ class ModerationService {
         },
       },
     );
-    await notifyUser({ _id: list.owner?._id ?? list.owner }, by, {
-      title: "List removed",
-      message: reason
-        ? `Your list "${list.name}" was removed by a moderator. Reason: ${reason}`
-        : `Your list "${list.name}" was removed by a moderator.`,
-      data: { listId: String(list._id) },
-    }).catch(() => {});
+    await notifyUser(
+      { _id: list.owner?._id ?? list.owner },
+      by,
+      { key: "list_removed", values: { list: list.name, reason } },
+      { listId: String(list._id) },
+    ).catch(() => {});
     return { lists: 1, reports: reports.modifiedCount };
   }
 

@@ -273,6 +273,8 @@ const userSchema = new Schema(
 
 // Indexes (email is already indexed via unique: true)
 userSchema.index({ status: 1 });
+// Hidden-author lookup (ReviewService.hiddenAuthorIds: deleted or not active).
+userSchema.index({ isDeleted: 1, status: 1 });
 userSchema.index({ role: 1 });
 userSchema.index({ following: 1 });
 userSchema.index({ invitedBy: 1 });
@@ -289,6 +291,22 @@ userSchema.pre("save", function () {
   }
   if (this.isModified("phone") || (this.phone && !this.phoneHash)) {
     this.phoneHash = this.phone ? hashContact(this.phone) : undefined;
+  }
+});
+
+// Switching the account to public accepts every pending follow request
+// (whichever endpoint saved it: settings or profile edit).
+userSchema.pre("save", function () {
+  this.$locals.wentPublic = !this.isNew && !this.isDeleted && this.isModified("isPrivate") && !this.isPrivate;
+});
+userSchema.post("save", async function (doc) {
+  if (!doc.$locals?.wentPublic) return;
+  doc.$locals.wentPublic = false;
+  try {
+    const { FollowRequestService } = await import("#services/FollowRequestService.js");
+    await FollowRequestService.acceptAll(doc._id);
+  } catch (error) {
+    console.error("Follow request auto-accept failed:", error.message);
   }
 });
 

@@ -25,6 +25,10 @@ UserRouter.post("/me/push-token", writeRateLimiter, userController.addPushToken)
 UserRouter.delete("/me/push-token", userController.removePushToken);
 UserRouter.post("/me/share", writeRateLimiter, userController.shareWithPeople);
 UserRouter.delete("/me/followers/:id", writeRateLimiter, userController.removeFollower);
+// Follow requests to my private account.
+UserRouter.get("/me/follow-requests", userController.getFollowRequests);
+UserRouter.post("/me/follow-requests/:userId/accept", writeRateLimiter, userController.acceptFollowRequest);
+UserRouter.post("/me/follow-requests/:userId/decline", writeRateLimiter, userController.declineFollowRequest);
 // Profile edit alias of PUT /api/auth/profile.
 UserRouter.put("/me", writeRateLimiter, authController.updateProfile);
 UserRouter.patch("/me", writeRateLimiter, authController.updateProfile);

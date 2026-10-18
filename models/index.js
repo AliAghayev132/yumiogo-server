@@ -19,3 +19,4 @@ export { Counter } from "./counter.model.js";
 export { Comment } from "./comment.model.js";
 export { ReviewLabelRequest } from "./reviewLabelRequest.model.js";
 export { RestaurantFollow } from "./restaurantFollow.model.js";
+export { FollowRequest } from "./followRequest.model.js";

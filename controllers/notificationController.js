@@ -1,12 +1,15 @@
 import { Notification } from "#models";
 import { AccountService } from "#services";
 import { asyncHandler } from "#utils";
+import { translated } from "#utils/translations.js";
+import { notificationCopy } from "#i18n/index.js";
 
 /**
  * Profile → Notifications. Items carry the actor and the target refs
  * (restaurant / list / review / comment), the rendered sentence and the
  * action keys the app shows as buttons (view_profile, follow_back, view_list,
- * view_restaurant, view_review, open_url).
+ * view_restaurant, view_review, open_url). Sentences, moderation notices and
+ * restaurant names are in the request's language (Accept-Language).
  */
 
 const ACTOR_FIELDS = "firstName lastName avatar verified isDeleted status";
@@ -17,9 +20,13 @@ const idOf = (ref) => (ref ? String(ref._id ?? ref) : "");
 const NEEDS_ACTOR = new Set([
   "follow",
   "follow_suggestion",
+  "follow_request",
+  "follow_accept",
   "list_save",
   "list_visit",
   "review_like",
+  "review_tag",
+  "comment_like",
   "comment",
   "reply",
   "mention",
@@ -29,8 +36,8 @@ const NEEDS_ACTOR = new Set([
 
 const unreadCount = (userId) => Notification.countDocuments({ recipient: userId, read: false });
 
-/** Notification → API shape for the recipient. */
-const shape = (n, viewer) => {
+/** Notification → API shape for the recipient, in `lang`. */
+const shape = (n, viewer, lang = "en") => {
   const following = new Set((viewer.following || []).map(String));
   const actor =
     n.actor && typeof n.actor === "object" && n.actor.firstName && !n.actor.isDeleted && n.actor.status === "active"
@@ -41,8 +48,14 @@ const shape = (n, viewer) => {
   const review = n.review && typeof n.review === "object" && !n.review.isDeleted ? n.review : null;
   const view = { ...n, actor, restaurant, list, review };
   const isFollowingActor = !!actor && following.has(idOf(actor));
-  const message = Notification.describe(view);
-  const actorName = actor ? `${actor.firstName} ${actor.lastName}`.trim() : "";
+  const message = Notification.describe(view, lang);
+  // data.anonymous: the actor is a stealth / private review author acting under
+  // their own review — sent without the actor, shown as "A Yumio member".
+  const actorName = actor
+    ? `${actor.firstName} ${actor.lastName}`.trim()
+    : n.data?.anonymous
+      ? notificationCopy(lang).member
+      : "";
 
   return {
     _id: n._id,
@@ -55,14 +68,19 @@ const shape = (n, viewer) => {
       : null,
     isFollowingActor,
     restaurant: restaurant
-      ? { _id: restaurant._id, name: restaurant.name, slug: restaurant.slug, coverImage: restaurant.coverImages?.[0] || null }
+      ? {
+          _id: restaurant._id,
+          name: translated(restaurant, "name", lang),
+          slug: restaurant.slug,
+          coverImage: restaurant.coverImages?.[0] || null,
+        }
       : null,
     list: list ? { _id: list._id, name: list.name, privacy: list.privacy, shareSlug: list.shareSlug } : null,
     review: review
       ? { _id: review._id, sentiment: review.sentiment, comment: String(review.comment || "").slice(0, 140) }
       : null,
     comment: n.comment || null,
-    title: n.title || "",
+    title: Notification.titleOf(view, lang),
     message, // sentence without the actor's name ("started following you.")
     text: actorName ? `${actorName} ${message}` : message, // full sentence
     data: n.data || {},
@@ -86,7 +104,7 @@ const listNotifications = asyncHandler(async (req, res) => {
       .skip((page - 1) * limit)
       .limit(limit)
       .populate("actor", ACTOR_FIELDS)
-      .populate("restaurant", "name slug coverImages isDeleted")
+      .populate("restaurant", "name slug coverImages isDeleted translations")
       .populate("list", "name privacy shareSlug isDeleted")
       .populate("review", "sentiment comment isDeleted")
       .lean(),
@@ -95,9 +113,9 @@ const listNotifications = asyncHandler(async (req, res) => {
   ]);
 
   const notifications = rows
-    .map((n) => shape(n, req.user))
+    .map((n) => shape(n, req.user, req.lang))
     // Drop items whose person is gone (deleted / suspended account).
-    .filter((n, i) => n.actor || !NEEDS_ACTOR.has(rows[i].type));
+    .filter((n, i) => n.actor || rows[i].data?.anonymous || !NEEDS_ACTOR.has(rows[i].type));
 
   res.json({
     success: true,

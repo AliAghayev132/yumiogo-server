@@ -1,9 +1,19 @@
 import validator from "validator";
 import { crypto, mongoose } from "#lib";
-import { User, Review, FavoriteList, Notification, OTP } from "#models";
+import {
+  User,
+  Review,
+  FavoriteList,
+  Notification,
+  OTP,
+  SearchHistory,
+  RestaurantView,
+  ReviewLabelRequest,
+} from "#models";
 import { FileService } from "./FileService.js";
 import { ReviewService } from "./ReviewService.js";
 import { RestaurantFollowService } from "./RestaurantFollowService.js";
+import { FollowRequestService } from "./FollowRequestService.js";
 
 /**
  * AccountService (static)
@@ -31,6 +41,9 @@ const E164 = /^\+[1-9]\d{7,14}$/;
 const INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 const idStr = (value) => (value ? String(value._id ?? value) : "");
+const VISIBILITY_LEVELS = ["everyone", "followers", "me"];
+// Expo push tokens kept per account (newest first).
+const PUSH_TOKENS_MAX = 10;
 
 class AccountService {
   static PASSWORD_RULES = PASSWORD_RULES.map(({ key, label }) => ({ key, label }));
@@ -117,6 +130,46 @@ class AccountService {
     };
   }
 
+  /**
+   * May `viewer` see `owner`'s activity guarded by `setting` (everyone /
+   * followers / me)? Private accounts are followers-only at most; only
+   * accepted follows count (pending follow requests don't). The owner and
+   * admins always can.
+   */
+  static canSeeVisibility(setting, owner, viewer) {
+    if (!owner) return false;
+    const ownerId = idStr(owner);
+    if (viewer && (idStr(viewer) === ownerId || viewer.role === "admin")) return true;
+    let level = VISIBILITY_LEVELS.includes(setting) ? setting : "everyone";
+    if (owner.isPrivate && level === "everyone") level = "followers";
+    if (level === "everyone") return true;
+    if (level === "followers") return !!viewer?.following?.some((id) => String(id) === ownerId);
+    return false;
+  }
+
+  /** Favourite lists of `owner` (settings.listsVisibility + isPrivate). */
+  static canSeeLists(viewer, owner) {
+    return this.canSeeVisibility(owner?.settings?.listsVisibility, owner, viewer);
+  }
+
+  // ---------------------------------------------------------- push tokens
+
+  /**
+   * Register an Expo push token for `userId`: newest first, at most
+   * PUSH_TOKENS_MAX, and removed from every other account (a shared device
+   * only notifies whoever signed in last). → number of devices
+   */
+  static async addPushToken(userId, token) {
+    await User.updateMany({ _id: { $ne: userId }, pushTokens: token }, { $pull: { pushTokens: token } });
+    await User.updateOne({ _id: userId }, { $pull: { pushTokens: token } });
+    await User.updateOne(
+      { _id: userId },
+      { $push: { pushTokens: { $each: [token], $position: 0, $slice: PUSH_TOKENS_MAX } } },
+    );
+    const user = await User.findById(userId, "pushTokens").lean();
+    return (user?.pushTokens || []).length;
+  }
+
   // -------------------------------------------------------------- invites
 
   static generateInviteCode(length = 8) {
@@ -193,8 +246,9 @@ class AccountService {
    *  - likes / comments by the user removed, counters fixed
    *  - owned lists deleted (Restaurant.saveCount fixed), membership and list
    *    saves in other people's lists removed
-   *  - follow edges both ways, suggestions, notifications, pending OTPs
-   *  - avatar file removed; personal data anonymised (the e-mail can register again)
+   *  - follow edges and follow requests both ways, suggestions, notifications, pending OTPs
+   *  - recent searches, restaurant views, label requests deleted
+   *  - avatar and review photo files removed; personal data anonymised (the e-mail can register again)
    * Used by DELETE /users/me (by: "self") and the admin panel (by: "admin").
    * → { deleted, summary } | { deleted: false, status, message }
    */
@@ -212,13 +266,15 @@ class AccountService {
     const now = new Date();
     const summary = {};
 
-    // 1) Reviews → hidden, ratings recomputed.
-    const reviews = await Review.find({ user: uid, isDeleted: false }, "_id restaurant").lean();
+    // 1) Reviews → hidden (their photos deleted), ratings recomputed.
+    const reviews = await Review.find({ user: uid, isDeleted: false }, "_id restaurant photos").lean();
     const restaurantIds = [...new Set(reviews.map((r) => String(r.restaurant)))];
     if (reviews.length) {
       await Review.updateMany({ user: uid, isDeleted: false }, { $set: { isDeleted: true, deletedAt: now } });
     }
     summary.reviews = reviews.length;
+    // Their photo files (unless another live review still uses one; never throws).
+    if (reviews.length) await ReviewService.deletePhotosOf(reviews);
 
     // Likes the user gave on reviews.
     const unliked = await Review.updateMany(
@@ -232,15 +288,14 @@ class AccountService {
 
     summary.restaurantsRecomputed = await ReviewService.recomputeRestaurants(restaurantIds);
 
-    // 2) Owned lists → deleted; saveCount adjusted for everything the user had saved.
-    const ownedLists = await FavoriteList.countDocuments({ owner: uid, isDeleted: false });
-    await FavoriteList.trackSaves(uid, null, () =>
-      FavoriteList.updateMany(
-        { owner: uid, isDeleted: false },
-        { $set: { isDeleted: true, deletedAt: now } },
-      ),
+    // 2) Owned lists → deleted; saveCount re-counted for everything the user had saved.
+    const owned = await FavoriteList.updateMany(
+      { owner: uid, isDeleted: false },
+      { $set: { isDeleted: true, deletedAt: now } },
     );
-    summary.lists = ownedLists;
+    const savedRestaurants = await FavoriteList.distinct("items.restaurant", { owner: uid, deletedAt: now });
+    await FavoriteList.recomputeSaveCounts(savedRestaurants);
+    summary.lists = owned.modifiedCount;
 
     // Membership in other people's lists.
     const collab = await FavoriteList.updateMany(
@@ -260,11 +315,22 @@ class AccountService {
     summary.followers = unfollowed.modifiedCount;
     summary.restaurantsFollowed = await RestaurantFollowService.removeUser(uid);
     summary.following = (user.following || []).length;
+    summary.followRequests = await FollowRequestService.removeUser(uid);
 
     // 4) Notifications to or from the user, pending codes.
     const notes = await Notification.deleteMany({ $or: [{ recipient: uid }, { actor: uid }] });
     summary.notifications = notes.deletedCount;
     await OTP.deleteMany({ email: user.email });
+
+    // Personal history: recent searches, restaurant views, label requests.
+    const [searches, views, labelRequests] = await Promise.all([
+      SearchHistory.deleteMany({ user: uid }),
+      RestaurantView.deleteMany({ $or: [{ user: uid }, { viewer: `u:${uid}` }] }),
+      ReviewLabelRequest.deleteMany({ user: uid }),
+    ]);
+    summary.searchHistory = searches.deletedCount;
+    summary.restaurantViews = views.deletedCount;
+    summary.labelRequests = labelRequests.deletedCount;
 
     // 5) Avatar file (remote Google avatars are just URLs).
     if (user.avatar && !/^https?:\/\//i.test(user.avatar)) FileService.deleteFile(user.avatar);

@@ -1,4 +1,5 @@
 import { Schema, Model } from "#constants";
+import { translationsField } from "#utils/translations.js";
 
 /**
  * ContentPage — a static document (Terms / Privacy / Cookies ...) addressed by
@@ -9,6 +10,7 @@ const pageSectionSchema = new Schema(
     heading: { type: String, default: "", trim: true },
     body: { type: String, default: "" },
     highlight: { type: Boolean, default: false },
+    translations: translationsField(["heading", "body"]),
   },
   { _id: false },
 );
@@ -37,6 +39,7 @@ const contentPageSchema = new Schema(
       default: [],
     },
     isPublished: { type: Boolean, default: true },
+    translations: translationsField(["title", "intro"]),
   },
   {
     timestamps: true,

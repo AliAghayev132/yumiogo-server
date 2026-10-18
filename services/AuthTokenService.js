@@ -1,6 +1,7 @@
 import { jwt, crypto } from "#lib";
 import { config } from "#config";
 import { User } from "#models";
+import socketService from "./SocketService.js";
 
 /**
  * AuthTokenService (static)
@@ -20,6 +21,15 @@ import { User } from "#models";
  *    gets the family's current token again instead of a revoke.
  * Refresh tokens issued before rotation existed (no fid / jti) are exchanged
  * once for a family of their own; using one again after that is reuse too.
+ *
+ * Every token of a family also carries `authAt` (unix seconds of the sign-in
+ * that opened it, kept across rotations), so sensitive actions can ask for a
+ * recent sign-in (isRecentSignIn).
+ *
+ * revokeAll() is THE way to sign an account out everywhere (password change /
+ * reset, logout-all, refresh-token reuse, role / status changes, account
+ * deletion): tokenVersion bump, refresh families and push tokens dropped,
+ * live sockets closed (a demoted admin leaves the `admins` room at once).
  */
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -28,6 +38,8 @@ const REFRESH_LIFETIME_MS = { normal: 7 * DAY_MS, rememberMe: 30 * DAY_MS };
 const REFRESH_GRACE_MS = 60 * 1000;
 // Signed-in devices kept per account (the oldest family is dropped beyond it).
 const MAX_SESSIONS = 20;
+// "Recent sign-in" window for sensitive actions (first password on a Google account).
+const RECENT_SIGN_IN_MS = 10 * 60 * 1000;
 
 const newId = () => crypto.randomBytes(16).toString("hex");
 // Stable id of a pre-rotation refresh token (it has no jti of its own).
@@ -98,8 +110,13 @@ class AuthTokenService {
   // ------------------------------------------------------ refresh sessions
 
   /** Access + refresh token pair for one family member. */
-  static sessionTokens(user, { family, jti, rememberMe }) {
-    const payload = { id: user._id, role: user.role, tokenVersion: user.tokenVersion };
+  static sessionTokens(user, { family, jti, rememberMe, authAt }) {
+    const payload = {
+      id: user._id,
+      role: user.role,
+      tokenVersion: user.tokenVersion,
+      ...(Number.isFinite(authAt) && authAt > 0 && { authAt }),
+    };
     return {
       accessToken: this.generateAccessToken(payload),
       refreshToken: this.generateRefreshToken({ ...payload, fid: family, jti }, rememberMe),
@@ -146,7 +163,8 @@ class AuthTokenService {
       $push: { refreshSessions: { $each: [session], $slice: -MAX_SESSIONS } },
     });
     if (legacyJti && !res.matchedCount) return null;
-    return this.sessionTokens(user, session);
+    // A pre-rotation token exchange is not a sign-in: no authAt.
+    return this.sessionTokens(user, { ...session, authAt: legacyJti ? 0 : Math.floor(now.getTime() / 1000) });
   }
 
   /**
@@ -192,18 +210,18 @@ class AuthTokenService {
           },
         },
       );
-      if (res.modifiedCount) return { tokens: this.sessionTokens(user, { ...family, jti }) };
+      if (res.modifiedCount) return { tokens: this.sessionTokens(user, { ...family, jti, authAt: decoded?.authAt }) };
       // A parallel refresh rotated it a moment ago: fall through to the grace check.
       family = findFamily(await load());
       if (!family) return { error: "expired" };
     }
 
     if (presented === family.prevJti && now - new Date(family.rotatedAt).getTime() <= REFRESH_GRACE_MS) {
-      return { tokens: this.sessionTokens(user, family) };
+      return { tokens: this.sessionTokens(user, { ...family, authAt: decoded?.authAt }) };
     }
 
     // An invalidated token came back: revoke every session of the account.
-    await User.updateOne({ _id: user._id }, { $inc: { tokenVersion: 1 }, $set: { refreshSessions: [] } });
+    await this.revokeAll(user._id);
     return { error: "reused" };
   }
 
@@ -222,9 +240,45 @@ class AuthTokenService {
     return !!res.modifiedCount;
   }
 
-  /** Sign out everywhere: drop every refresh family (callers bump tokenVersion). */
+  /** Drop every refresh family (no tokenVersion bump — prefer revokeAll). */
   static clearSessions(userId) {
     return User.updateOne({ _id: userId }, { $set: { refreshSessions: [] } });
+  }
+
+  /**
+   * Sign an account out everywhere: bump tokenVersion (every access / refresh
+   * / reset token dies), drop every refresh family and push token, and close
+   * its live sockets (they reconnect only with a new token, with the role read
+   * fresh — a demoted admin is out of the `admins` room immediately).
+   * Options:
+   *  - bump: false when the caller already bumped tokenVersion in its own save;
+   *  - set: extra fields for the same update (e.g. a new password hash);
+   *  - keepPushTokens: push tokens of the device that stays signed in.
+   * → the account's new tokenVersion (null when it does not exist)
+   */
+  static async revokeAll(userId, { bump = true, set = {}, keepPushTokens = [] } = {}) {
+    if (!userId) return null;
+    const keep = (Array.isArray(keepPushTokens) ? keepPushTokens : []).filter((t) => typeof t === "string" && t);
+    const updated = await User.findOneAndUpdate(
+      { _id: userId },
+      {
+        $set: { ...set, refreshSessions: [], pushTokens: keep },
+        ...(bump && { $inc: { tokenVersion: 1 } }),
+      },
+      { returnDocument: "after", projection: { tokenVersion: 1 } },
+    );
+    socketService.disconnectUser(String(userId));
+    return updated ? updated.tokenVersion : null;
+  }
+
+  /**
+   * True when `accessToken` belongs to a sign-in (password / Google / sign-up)
+   * made within the last `maxAgeMs` (refreshes keep the original sign-in time).
+   */
+  static isRecentSignIn(accessToken, maxAgeMs = RECENT_SIGN_IN_MS) {
+    const decoded = typeof accessToken === "string" ? this.verifyAccessToken(accessToken) : null;
+    const authAt = Number(decoded?.authAt);
+    return Number.isFinite(authAt) && authAt > 0 && Date.now() - authAt * 1000 <= maxAgeMs;
   }
 
   /**

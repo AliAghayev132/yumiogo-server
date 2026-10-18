@@ -3,6 +3,8 @@ import { User } from "./user.model.js";
 import { FavoriteList } from "./favoriteList.model.js";
 // Imported directly (not via the #services barrel) to avoid a models <-> services cycle.
 import { MailService } from "#services/MailService.js";
+import { fill, notificationCopy, systemNotificationText } from "#i18n/index.js";
+import { translated } from "#utils/translations.js";
 
 /**
  * Notification — an activity item for a user (Profile → Notifications).
@@ -16,14 +18,26 @@ import { MailService } from "#services/MailService.js";
  * Types (shared list in #constants):
  *   follow — X started following you
  *   follow_suggestion — X (invited by you / from your contacts) joined — follow back?
+ *   follow_request — X asked to follow your private account (accept / decline;
+ *     data.status = "accepted" once accepted, retracted when declined / cancelled)
+ *   follow_accept — X accepted your follow request
  *   list_save — X added your favourites list to their collection
  *   list_visit — X visited <restaurant> — a place on your list
  *   review_like / comment / reply / mention — activity on your review / comment
+ *   review_tag — X tagged you in their review (once per review)
+ *   comment_like — X liked your comment
  *   share — X shared a restaurant / list with you
  *   collaborator_invite — X added you to a list
  *   restaurant_offer / restaurant_menu — a restaurant you follow has a new
  *     discount / new dishes (no actor)
- *   system — admin announcement ("review" / "list" are legacy)
+ *   system — admin announcement / moderation notice ("review" / "list" are legacy)
+ *
+ * Language: sentences are rendered in the reader's language (list: the
+ * request's Accept-Language; push: the recipient's `language`), with the
+ * restaurant name in that language. Moderation notices pass `copy`
+ * ({ key, values }, see NOTIFICATION_COPY.system in i18n/messages.js): it is
+ * stored as data.i18n and rendered per language, the English title / message
+ * stay stored as the fallback (admin-written announcements are shown as is).
  */
 export const NOTIFICATION_TYPES = notificationTypes;
 
@@ -37,6 +51,8 @@ const DEDUPE_TYPES = new Set([
   "list_save",
   "list_visit",
   "review_like",
+  "review_tag",
+  "comment_like",
   "collaborator_invite",
   "restaurant_offer",
   "restaurant_menu",
@@ -86,6 +102,11 @@ notificationSchema.index({ recipient: 1, createdAt: -1 });
 notificationSchema.index({ recipient: 1, read: 1 });
 notificationSchema.index({ recipient: 1, dedupeKey: 1, createdAt: -1 });
 notificationSchema.index({ actor: 1 });
+// Target lookups for retract / purge (content deleted, hidden or unliked).
+notificationSchema.index({ review: 1 });
+notificationSchema.index({ comment: 1 });
+notificationSchema.index({ restaurant: 1 });
+notificationSchema.index({ list: 1 });
 
 const idStr = (value) => (value ? String(value._id ?? value) : "");
 const fullName = (u) => [u?.firstName, u?.lastName].filter(Boolean).join(" ").trim();
@@ -112,46 +133,78 @@ const sendPush = async (user, { title, body, data }) => {
   }
 };
 
+/** Restaurant name of a populated notification in `lang` ("" when not populated). */
+const restaurantName = (n, lang) => (n.restaurant?.name ? translated(n.restaurant, "name", lang) : "");
+
+/** Moderation notice in `lang` from data.i18n, or null (admin text / legacy). */
+const systemText = (n, lang) =>
+  n.type === "system" && n.data?.i18n
+    ? systemNotificationText(n.data.i18n, lang, { restaurant: restaurantName(n, lang) })
+    : null;
+
 /**
- * Rendered sentence WITHOUT the actor's name (the app bolds/prefixes it):
- * "started following you.", "visited Nero Bistro — a place on your list."
+ * Rendered sentence in `lang` (en / az / ru) WITHOUT the actor's name (the
+ * app bolds/prefixes it): "started following you.", "visited Nero Bistro — a
+ * place on your list."
  */
-notificationSchema.statics.describe = function (n) {
-  const restaurant = n.restaurant?.name;
+notificationSchema.statics.describe = function (n, lang = "en") {
+  const copy = notificationCopy(lang);
+  const name = restaurantName(n, lang);
+  const restaurant = name ? fill(copy.quote, { name }) : "";
   const list = n.list?.name;
+  const say = (key, anyKey, values = {}) =>
+    restaurant || !anyKey ? fill(copy[key], { restaurant, list, ...values }) : fill(copy[anyKey], { list, ...values });
   switch (n.type) {
     case "follow":
-      return "started following you.";
+      return copy.follow;
     case "follow_suggestion":
-      return n.data?.reason === "contact"
-        ? "from your contacts joined Yumio. Follow them back?"
-        : "joined Yumio with your invite. Follow them back?";
+      return n.data?.reason === "contact" ? copy.followSuggestionContact : copy.followSuggestionInvite;
+    // A request is updated to data.status = "accepted" once accepted (declined ones are retracted).
+    case "follow_request":
+      return n.data?.status === "accepted" ? copy.follow : copy.followRequest;
+    case "follow_accept":
+      return copy.followAccept;
     case "list_save":
-      return "added your favourites list to their collection.";
+      return copy.listSave;
     case "list_visit":
-      return restaurant ? `visited ${restaurant} — a place on your list.` : "visited a place on your list.";
+      return say("listVisit", "listVisitAny");
     case "review_like":
-      return restaurant ? `liked your review of ${restaurant}.` : "liked your review.";
+      return say("reviewLike", "reviewLikeAny");
+    case "review_tag":
+      return say("reviewTag", "reviewTagAny");
+    case "comment_like":
+      return copy.commentLike;
     case "comment":
-      return restaurant ? `commented on your review of ${restaurant}.` : "commented on your review.";
+      return say("comment", "commentAny");
     case "reply":
-      return "replied to your comment.";
+      return copy.reply;
     case "mention":
-      return "mentioned you in a comment.";
+      return copy.mention;
     case "share":
-      if (list) return `shared the list "${list}" with you.`;
-      return restaurant ? `shared ${restaurant} with you.` : "shared something with you.";
+      if (list) return fill(copy.shareList, { list });
+      return say("shareRestaurant", "shareAny");
     case "collaborator_invite":
-      return list ? `added you to the list "${list}".` : "added you to a list.";
+      return list ? fill(copy.collaboratorInvite, { list }) : copy.collaboratorInviteAny;
     case "restaurant_offer": {
-      const off = Number(n.data?.discountPercent) > 0 ? `${Number(n.data.discountPercent)}% off` : "a new discount";
-      return restaurant ? `${restaurant} now has ${off}.` : `A restaurant you follow now has ${off}.`;
+      const percent = Number(n.data?.discountPercent);
+      const offer = percent > 0 ? fill(copy.offerPercent, { percent }) : copy.offerAny;
+      return say("restaurantOffer", "restaurantOfferAny", { offer });
     }
     case "restaurant_menu":
-      return restaurant ? `${restaurant} added new dishes to the menu.` : "A restaurant you follow added new dishes.";
-    default:
+      return say("restaurantMenu", "restaurantMenuAny");
+    case "review":
+      // Legacy rows: companion tags / comment likes were stored as "review".
+      if (n.data?.reason === "companion") return say("reviewTag", "reviewTagAny");
+      if (n.data?.reason === "comment_like") return copy.commentLike;
       return n.message || n.title || "";
+    default:
+      return systemText(n, lang)?.message || n.message || n.title || "";
   }
+};
+
+/** Title in `lang` (moderation notices; otherwise the stored title). */
+notificationSchema.statics.titleOf = function (n, lang = "en") {
+  return systemText(n, lang)?.title || n.title || "";
 };
 
 /** Action keys the app renders as buttons (labels live in the app). */
@@ -160,6 +213,11 @@ notificationSchema.statics.actionsFor = function (n, { isFollowingActor = false 
     case "follow":
     case "follow_suggestion":
       return isFollowingActor ? ["view_profile"] : ["view_profile", "follow_back"];
+    case "follow_request":
+      if (n.data?.status !== "accepted") return ["accept_follow", "decline_follow"];
+      return isFollowingActor ? ["view_profile"] : ["view_profile", "follow_back"];
+    case "follow_accept":
+      return ["view_profile"];
     case "list_save":
     case "collaborator_invite":
       return n.list ? ["view_list"] : [];
@@ -168,9 +226,12 @@ notificationSchema.statics.actionsFor = function (n, { isFollowingActor = false 
     case "restaurant_menu":
       return n.restaurant ? ["view_restaurant"] : [];
     case "review_like":
+    case "review_tag":
+    case "comment_like":
     case "comment":
     case "reply":
     case "mention":
+    case "review": // legacy companion tags / comment likes
       return n.review ? ["view_review"] : [];
     case "share":
       if (n.list) return ["view_list"];
@@ -198,6 +259,7 @@ notificationSchema.statics.notify = async function ({
   title = "",
   message = "",
   data = {},
+  copy = null,
   dedupe = true,
 } = {}) {
   try {
@@ -221,6 +283,16 @@ notificationSchema.statics.notify = async function ({
       if (existing) return existing;
     }
 
+    // Moderation notice: stable copy key + values, English text as the fallback.
+    if (copy?.key) {
+      const english = systemNotificationText(copy, "en");
+      if (english) {
+        title = title || english.title;
+        message = message || english.message;
+      }
+      data = { ...data, i18n: { key: copy.key, values: copy.values || {} } };
+    }
+
     const doc = await this.create({
       recipient: user._id,
       actor,
@@ -229,8 +301,8 @@ notificationSchema.statics.notify = async function ({
       list,
       review,
       comment,
-      title,
-      message,
+      title: String(title || "").slice(0, 120),
+      message: String(message || "").slice(0, 500),
       data,
       dedupeKey,
     });
@@ -241,15 +313,16 @@ notificationSchema.statics.notify = async function ({
     if (wantsPush || wantsEmail) {
       const populated = await doc.populate([
         { path: "actor", select: "firstName lastName" },
-        { path: "restaurant", select: "name" },
+        { path: "restaurant", select: "name translations" },
         { path: "list", select: "name" },
       ]);
       const actorName = fullName(populated.actor);
-      const sentence = this.describe(populated);
+      // In the recipient's language (their app language setting).
+      const sentence = this.describe(populated, user.language);
       if (wantsPush) {
         sendPush(user, {
-          title: type === "system" ? title || "Yumio" : actorName || "Yumio",
-          body: type === "system" ? message : sentence,
+          title: type === "system" ? this.titleOf(populated, user.language) || "Yumio" : actorName || "Yumio",
+          body: sentence,
           data: {
             notificationId: String(doc._id),
             type,

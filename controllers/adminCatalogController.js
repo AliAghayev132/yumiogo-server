@@ -1,5 +1,5 @@
 // Models
-import { Taxonomy, City, Faq, ContentPage, OnboardingSlide, Restaurant } from "#models";
+import { Taxonomy, City, Faq, ContentPage, OnboardingSlide, Restaurant, User } from "#models";
 
 // Constants
 import {
@@ -15,6 +15,7 @@ import { CatalogService } from "#services";
 
 // Utils
 import { asyncHandler, escapeRegex } from "#utils";
+import { cleanTranslations, mergeTranslations } from "#utils/translations.js";
 
 /**
  * Admin CRUD for the catalog (taxonomies, cities) and app content (FAQs,
@@ -42,6 +43,24 @@ const optionalString = (value) => {
   if (value === null) return null;
   const text = String(value).trim();
   return text || null;
+};
+
+/**
+ * `body.translations` ({ az: {…}, ru: {…} }, every text optional) for `list`
+ * fields, validated into `fields.translations`. → error message or null.
+ */
+const readTranslations = (body, list, fields, options) => {
+  const { value, error } = cleanTranslations(body.translations, list, options);
+  if (error) return error;
+  if (value !== undefined) fields.translations = value;
+  return null;
+};
+
+// Update: merge the incoming translations into the stored ones.
+const mergedFields = (doc, fields) => {
+  if (fields.translations === undefined) return fields;
+  const current = doc.translations?.toObject ? doc.translations.toObject() : doc.translations;
+  return { ...fields, translations: mergeTranslations(current, fields.translations) };
 };
 
 // Next order value at the end of a list.
@@ -105,6 +124,8 @@ const taxonomyFields = (body, type) => {
   if (body.showInOnboarding !== undefined && ONBOARDING_TYPES.includes(type)) {
     fields.showInOnboarding = toBool(body.showInOnboarding);
   }
+  const translationError = readTranslations(body, ["name", "description", "group"], fields, { maxLength: 300 });
+  if (translationError) return { error: translationError };
 
   return { fields };
 };
@@ -213,7 +234,7 @@ const updateTaxonomy = asyncHandler(async (req, res) => {
     }
   }
 
-  item.set(fields);
+  item.set(mergedFields(item, fields));
   await item.save();
 
   const cascaded = await CatalogService.cascadeRename(item.type, oldName, item.name);
@@ -282,6 +303,8 @@ const cityFields = (body) => {
   }
   if (body.isActive !== undefined) fields.isActive = toBool(body.isActive);
   if (body.isDefault !== undefined) fields.isDefault = toBool(body.isDefault);
+  const translationError = readTranslations(body, ["name", "label", "country"], fields, { maxLength: 120 });
+  if (translationError) return { error: translationError };
   return { fields };
 };
 
@@ -345,7 +368,9 @@ const createCity = asyncHandler(async (req, res) => {
 });
 
 /**
- * Update a city; a rename cascades into Restaurant.city.
+ * Update a city; a rename cascades into Restaurant.city and User.city, and the
+ * restaurants' address search keys (which carry the city's name in every
+ * language) are recomputed after a rename or a change of its az / ru names.
  * PUT /api/admin/cities/:id
  */
 const updateCity = asyncHandler(async (req, res) => {
@@ -368,21 +393,29 @@ const updateCity = asyncHandler(async (req, res) => {
   }
   if (fields.label === "") fields.label = `${fields.name ?? city.name}, ${fields.country ?? city.country}`;
 
-  city.set(fields);
+  city.set(mergedFields(city, fields));
   await city.save();
   if (city.isDefault) await makeOnlyDefault(city);
 
   let cascaded = 0;
+  let users = 0;
   if (city.name !== oldName) {
+    // updateMany skips the save hook → the search keys are refreshed below.
     const result = await Restaurant.updateMany({ city: oldName }, { $set: { city: city.name } });
     cascaded = result.modifiedCount;
+    users = (await User.updateMany({ city: oldName }, { $set: { city: city.name } })).modifiedCount;
+    CatalogService.invalidateCounts();
+  }
+  if (city.name !== oldName || fields.translations !== undefined) {
+    await Restaurant.refreshSearchKeys({ city: city.name });
   }
 
-  res.json({ success: true, message: "City updated", data: { city, cascaded } });
+  res.json({ success: true, message: "City updated", data: { city, cascaded, users } });
 });
 
 /**
- * Delete a city (refused while restaurants still use it).
+ * Delete a city (refused while restaurants still use it). Users who picked it
+ * as their city are left without one (User.city "" — they can pick another).
  * DELETE /api/admin/cities/:id
  */
 const deleteCity = asyncHandler(async (req, res) => {
@@ -399,7 +432,8 @@ const deleteCity = asyncHandler(async (req, res) => {
   }
 
   await city.deleteOne();
-  res.json({ success: true, message: "City deleted" });
+  const users = (await User.updateMany({ city: city.name }, { $set: { city: "" } })).modifiedCount;
+  res.json({ success: true, message: "City deleted", data: { users } });
 });
 
 /**
@@ -437,6 +471,8 @@ const faqFields = (body) => {
     fields.order = order;
   }
   if (body.isActive !== undefined) fields.isActive = toBool(body.isActive);
+  const translationError = readTranslations(body, ["question", "answer", "category"], fields);
+  if (translationError) return { error: translationError };
   return { fields };
 };
 
@@ -474,7 +510,7 @@ const updateFaq = asyncHandler(async (req, res) => {
   const { fields, error } = faqFields(req.body);
   if (error) return badRequest(res, error);
 
-  faq.set(fields);
+  faq.set(mergedFields(faq, fields));
   await faq.save();
   res.json({ success: true, message: "FAQ updated", data: { faq } });
 });
@@ -522,6 +558,8 @@ const slideFields = (body) => {
     fields.order = order;
   }
   if (body.isActive !== undefined) fields.isActive = toBool(body.isActive);
+  const translationError = readTranslations(body, ["title", "subtitle"], fields, { maxLength: 500 });
+  if (translationError) return { error: translationError };
   return { fields };
 };
 
@@ -560,7 +598,7 @@ const updateSlide = asyncHandler(async (req, res) => {
   if (error) return badRequest(res, error);
 
   const oldImage = slide.image;
-  slide.set(fields);
+  slide.set(mergedFields(slide, fields));
   await slide.save();
   if (oldImage && oldImage !== slide.image) CatalogService.deleteUpload(oldImage, uploadPaths.content);
 
@@ -614,7 +652,8 @@ const getPage = asyncHandler(async (req, res) => {
 
 /**
  * Create or replace a content page.
- * PUT /api/admin/pages/:slug  { title, intro, sections: [{ heading, body, highlight }], isPublished }
+ * PUT /api/admin/pages/:slug  { title, intro, sections: [{ heading, body, highlight, translations }],
+ *   isPublished, translations: { az: { title, intro }, ru: { … } } }
  */
 const upsertPage = asyncHandler(async (req, res) => {
   const slug = String(req.params.slug || "").trim().toLowerCase();
@@ -634,13 +673,26 @@ const upsertPage = asyncHandler(async (req, res) => {
     if (sections.some((s) => s === null || typeof s !== "object")) {
       return badRequest(res, "Each section must be an object");
     }
-    fields.sections = sections.map((s) => ({
-      heading: String(s.heading ?? "").trim(),
-      body: String(s.body ?? ""),
-      highlight: toBool(s.highlight),
-    }));
+    const cleaned = [];
+    for (const [index, s] of sections.entries()) {
+      const section = {
+        heading: String(s.heading ?? "").trim(),
+        body: String(s.body ?? ""),
+        highlight: toBool(s.highlight),
+      };
+      const { value, error } = cleanTranslations(s.translations, ["heading", "body"], {
+        maxLength: 20000,
+        label: `sections[${index}].translations`,
+      });
+      if (error) return badRequest(res, error);
+      if (value !== undefined) section.translations = value;
+      cleaned.push(section);
+    }
+    fields.sections = cleaned;
   }
   if (isPublished !== undefined) fields.isPublished = toBool(isPublished);
+  const translationError = readTranslations(req.body, ["title", "intro"], fields, { maxLength: 20000 });
+  if (translationError) return badRequest(res, translationError);
 
   let page = await ContentPage.findOne({ slug });
   const created = !page;
@@ -648,7 +700,7 @@ const upsertPage = asyncHandler(async (req, res) => {
     if (!fields.title) return badRequest(res, "Title is required");
     page = new ContentPage({ slug });
   }
-  page.set(fields);
+  page.set(created ? fields : mergedFields(page, fields));
   await page.save();
 
   res

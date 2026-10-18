@@ -13,7 +13,8 @@ import { asyncHandler, paging, pageInfo } from "#utils";
  * dishes to its menu (RestaurantFollowService.notifyFollowers).
  */
 
-const notFound = (res) => res.status(404).json({ success: false, message: "Restaurant not found" });
+const notFound = (res) =>
+  res.status(404).json({ success: false, message: "Restaurant not found", code: "RESTAURANT_NOT_FOUND" });
 
 /** Active restaurant by id or slug → its _id, or null. */
 const findActiveId = async (idOrSlug) => {
@@ -61,7 +62,8 @@ const getFollowedRestaurantIds = asyncHandler(async (req, res) => {
 });
 
 /**
- * Restaurants I follow, most recently followed first (live restaurants only).
+ * Restaurants I follow, most recently followed first (live restaurants only;
+ * the page / total are computed over those).
  * GET /api/restaurants/following?page=&limit=&near=
  * → { restaurants: [restaurant + followedAt, isFollowing], pagination }
  */

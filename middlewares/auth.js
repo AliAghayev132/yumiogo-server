@@ -7,6 +7,9 @@ import { AuthTokenService } from "#services";
  * Authenticate an access token and attach the user to req.user.
  */
 const authenticate = async (req, res, next) => {
+  // Already done for this request (app.js authenticates multipart routes
+  // before parsing their bodies; the router runs it again).
+  if (req.user && req.authenticated) return next();
   try {
     const authHeader = req.header("Authorization");
 
@@ -41,6 +44,7 @@ const authenticate = async (req, res, next) => {
     }
 
     req.user = user;
+    req.authenticated = true;
     next();
   } catch (error) {
     if (error.name === "TokenExpiredError") {

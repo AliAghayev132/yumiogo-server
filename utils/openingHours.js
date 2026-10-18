@@ -99,11 +99,12 @@ const isOpenAt = (hours, date = new Date(), timezone = currentTimezone) => {
 
 /**
  * Derived Restaurant.openNow: temporarily closed → false; no hours configured →
- * open; otherwise computed from the weekly hours in the app timezone.
+ * false (unknown — never reported or filtered as "Open now"); otherwise
+ * computed from the weekly hours in the app timezone.
  */
 const computeOpenNow = ({ hours, temporarilyClosed }, date = new Date(), timezone = currentTimezone) => {
   if (temporarilyClosed) return false;
-  if (!hasHours(hours)) return true;
+  if (!hasHours(hours)) return false;
   return isOpenAt(hours, date, timezone);
 };
 
@@ -119,6 +120,66 @@ const DAY_NAMES = {
   sat: "Saturday",
 };
 
+// Fallback `label` / `text` / `name` copy per language. Clients build their own
+// text from the structured fields (state, openUntil, opensAt, opensDay,
+// opensInDays, hoursWeek open/close); these strings are the fallback.
+const COPY = {
+  en: {
+    days: DAY_NAMES,
+    clock: "12h",
+    temporarilyClosed: "Temporarily closed",
+    noHours: "Hours not available",
+    openUntil: (time) => `Open until ${time}`,
+    open24h: "Open 24 hours",
+    opensAt: (time) => `Closed · Opens at ${time}`,
+    opensTomorrow: (time) => `Closed · Opens tomorrow at ${time}`,
+    opensOn: (day, time) => `Closed · Opens ${day} at ${time}`,
+    closed: "Closed",
+  },
+  az: {
+    days: {
+      sun: "Bazar",
+      mon: "Bazar ertəsi",
+      tue: "Çərşənbə axşamı",
+      wed: "Çərşənbə",
+      thu: "Cümə axşamı",
+      fri: "Cümə",
+      sat: "Şənbə",
+    },
+    clock: "24h",
+    temporarilyClosed: "Müvəqqəti bağlıdır",
+    noHours: "İş saatları məlum deyil",
+    openUntil: (time) => `Açıqdır · ${time}-dək`,
+    open24h: "24 saat açıqdır",
+    opensAt: (time) => `Bağlıdır · Açılır: ${time}`,
+    opensTomorrow: (time) => `Bağlıdır · Sabah açılır: ${time}`,
+    opensOn: (day, time) => `Bağlıdır · Açılır: ${day}, ${time}`,
+    closed: "Bağlıdır",
+  },
+  ru: {
+    days: {
+      sun: "Воскресенье",
+      mon: "Понедельник",
+      tue: "Вторник",
+      wed: "Среда",
+      thu: "Четверг",
+      fri: "Пятница",
+      sat: "Суббота",
+    },
+    clock: "24h",
+    temporarilyClosed: "Временно закрыто",
+    noHours: "Часы работы не указаны",
+    openUntil: (time) => `Открыто до ${time}`,
+    open24h: "Открыто круглосуточно",
+    opensAt: (time) => `Закрыто · Откроется в ${time}`,
+    opensTomorrow: (time) => `Закрыто · Откроется завтра в ${time}`,
+    opensOn: (day, time) => `Закрыто · Откроется: ${day}, ${time}`,
+    closed: "Закрыто",
+  },
+};
+
+const copyOf = (lang) => COPY[lang] || COPY.en;
+
 /** Minutes since midnight → "11:00 PM" (12-hour clock, as in the Figma Hours sheet). */
 const formatTime12 = (minutes) => {
   const m = ((minutes % 1440) + 1440) % 1440;
@@ -127,18 +188,31 @@ const formatTime12 = (minutes) => {
   return `${h12}:${String(m % 60).padStart(2, "0")} ${h24 < 12 ? "AM" : "PM"}`;
 };
 
+/** Minutes since midnight → "23:00". */
+const formatTime24 = (minutes) => {
+  const m = ((minutes % 1440) + 1440) % 1440;
+  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+};
+
+// Display time in the language's clock (labels only; structured fields stay 12h).
+const displayTime = (minutes, copy) => (copy.clock === "24h" ? formatTime24(minutes) : formatTime12(minutes));
+
 /**
  * Current open/closed status in the app timezone, with the strings the cards
  * and the Hours sheet show:
- *   { isOpen, state, label, openUntil, opensAt, opensDay }
+ *   { isOpen, state, label, openUntil, opensAt, opensDay, opensInDays }
  * state: "open" | "open24h" | "noHours" | "closed" | "temporarilyClosed".
+ * "noHours" = unknown (no weekly hours configured): isOpen is false and the
+ * label says the hours are not available. openUntil / opensAt are "11:00 PM";
+ * `label` is in `lang` (en / az / ru, English by default).
  */
-const openStatus = ({ hours, temporarilyClosed }, date = new Date(), timezone = currentTimezone) => {
-  const base = { openUntil: null, opensAt: null, opensDay: null };
+const openStatus = ({ hours, temporarilyClosed }, date = new Date(), timezone = currentTimezone, lang = "en") => {
+  const copy = copyOf(lang);
+  const base = { openUntil: null, opensAt: null, opensDay: null, opensInDays: null };
   if (temporarilyClosed) {
-    return { ...base, isOpen: false, state: "temporarilyClosed", label: "Temporarily closed" };
+    return { ...base, isOpen: false, state: "temporarilyClosed", label: copy.temporarilyClosed };
   }
-  if (!hasHours(hours)) return { ...base, isOpen: true, state: "noHours", label: "Open now" };
+  if (!hasHours(hours)) return { ...base, isOpen: false, state: "noHours", label: copy.noHours };
 
   const { day, minutes } = zonedNow(date, timezone);
   const index = DAY_KEYS.indexOf(day);
@@ -148,11 +222,11 @@ const openStatus = ({ hours, temporarilyClosed }, date = new Date(), timezone = 
   // Open: yesterday's slot spilling past midnight, or today's slot.
   if (yesterday && yesterday.close < yesterday.open && minutes < yesterday.close) {
     const openUntil = formatTime12(yesterday.close);
-    return { ...base, isOpen: true, state: "open", label: `Open until ${openUntil}`, openUntil };
+    return { ...base, isOpen: true, state: "open", label: copy.openUntil(displayTime(yesterday.close, copy)), openUntil };
   }
   if (today) {
     if (today.open === today.close) {
-      return { ...base, isOpen: true, state: "open24h", label: "Open 24 hours" };
+      return { ...base, isOpen: true, state: "open24h", label: copy.open24h };
     }
     const inSlot =
       today.close > today.open
@@ -160,17 +234,17 @@ const openStatus = ({ hours, temporarilyClosed }, date = new Date(), timezone = 
         : minutes >= today.open;
     if (inSlot) {
       const openUntil = formatTime12(today.close);
-      return { ...base, isOpen: true, state: "open", label: `Open until ${openUntil}`, openUntil };
+      return { ...base, isOpen: true, state: "open", label: copy.openUntil(displayTime(today.close, copy)), openUntil };
     }
     if (minutes < today.open) {
-      const opensAt = formatTime12(today.open);
       return {
         ...base,
         isOpen: false,
         state: "closed",
-        label: `Closed · Opens at ${opensAt}`,
-        opensAt,
+        label: copy.opensAt(displayTime(today.open, copy)),
+        opensAt: formatTime12(today.open),
         opensDay: day,
+        opensInDays: 0,
       };
     }
   }
@@ -180,41 +254,43 @@ const openStatus = ({ hours, temporarilyClosed }, date = new Date(), timezone = 
     const nextDay = DAY_KEYS[(index + ahead) % 7];
     const slot = slotOf(dayEntry(hours, nextDay));
     if (!slot) continue;
-    const opensAt = formatTime12(slot.open);
-    const when = ahead === 1 ? "tomorrow" : DAY_NAMES[nextDay];
+    const time = displayTime(slot.open, copy);
     return {
       ...base,
       isOpen: false,
       state: "closed",
-      label: `Closed · Opens ${when} at ${opensAt}`,
-      opensAt,
+      label: ahead === 1 ? copy.opensTomorrow(time) : copy.opensOn(copy.days[nextDay], time),
+      opensAt: formatTime12(slot.open),
       opensDay: nextDay,
+      opensInDays: ahead,
     };
   }
-  return { ...base, isOpen: false, state: "closed", label: "Closed" };
+  return { ...base, isOpen: false, state: "closed", label: copy.closed };
 };
 
 /**
  * The week for the Hours sheet, Sunday first (Figma 1:14965):
- * [{ day, name, isToday, closed, open, close, text }] with 12-hour times;
- * an unset day has text "" (unknown). Empty when no hours are configured.
+ * [{ day, name, isToday, closed, open24h, open, close, text }] with 12-hour
+ * open / close times. Once any day has hours, a day without hours counts as
+ * closed (as openStatus treats it). `name` / `text` are in `lang`. Empty when
+ * no hours are configured.
  */
-const hoursWeek = (hours, date = new Date(), timezone = currentTimezone) => {
+const hoursWeek = (hours, date = new Date(), timezone = currentTimezone, lang = "en") => {
   if (!hasHours(hours)) return [];
+  const copy = copyOf(lang);
   const { day: todayKey } = zonedNow(date, timezone);
   return DAY_KEYS.map((day) => {
-    const entry = dayEntry(hours, day);
-    const slot = slotOf(entry);
-    const closed = !!entry?.closed;
-    let text = "";
-    if (closed) text = "Closed";
-    else if (slot && slot.open === slot.close) text = "Open 24 hours";
-    else if (slot) text = `${formatTime12(slot.open)} - ${formatTime12(slot.close)}`;
+    const slot = slotOf(dayEntry(hours, day));
+    const open24h = !!slot && slot.open === slot.close;
+    let text = copy.closed;
+    if (open24h) text = copy.open24h;
+    else if (slot) text = `${displayTime(slot.open, copy)} - ${displayTime(slot.close, copy)}`;
     return {
       day,
-      name: DAY_NAMES[day],
+      name: copy.days[day],
       isToday: day === todayKey,
-      closed,
+      closed: !slot,
+      open24h,
       open: slot ? formatTime12(slot.open) : null,
       close: slot ? formatTime12(slot.close) : null,
       text,
@@ -233,6 +309,7 @@ export {
   isOpenAt,
   computeOpenNow,
   formatTime12,
+  formatTime24,
   openStatus,
   hoursWeek,
 };

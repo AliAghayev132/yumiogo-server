@@ -1,4 +1,5 @@
 import { Schema, Model, faqAudiences } from "#constants";
+import { translationsField } from "#utils/translations.js";
 
 /**
  * Faq — a question/answer pair shown in the app's Help & support screen
@@ -28,6 +29,7 @@ const faqSchema = new Schema(
     },
     order: { type: Number, default: 0 },
     isActive: { type: Boolean, default: true },
+    translations: translationsField(["question", "answer", "category"]),
   },
   {
     timestamps: true,

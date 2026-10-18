@@ -1,4 +1,4 @@
-import { Report, Review, User, Restaurant, FavoriteList } from "#models";
+import { Report, User, Restaurant, FavoriteList } from "#models";
 import { reportTargetTypes } from "#constants";
 import { ReviewService, CatalogService } from "#services";
 import { asyncHandler } from "#utils";
@@ -20,17 +20,19 @@ const fullName = (u) => `${u?.firstName || ""} ${u?.lastName || ""}`.trim();
 /**
  * Load a reportable target. → { label, owner } or { error, status }
  * (targets must exist and not be deleted; you cannot report your own content).
+ * Reviews must be ones the reporter can see (ReviewService.findVisible:
+ * approved, active author, public restaurant) — someone else's pending /
+ * rejected review, or one of a hidden restaurant, is "not found".
  */
-const loadTarget = async (targetType, targetId, reporterId) => {
-  const self = String(reporterId);
+const loadTarget = async (targetType, targetId, reporter) => {
+  const self = String(reporter._id);
   switch (targetType) {
     case "review": {
-      const review = await Review.findOne({ _id: targetId, isDeleted: false }, "user number restaurant")
-        .populate("restaurant", "name")
-        .lean();
+      const review = await ReviewService.findVisible(targetId, reporter, { populate: false });
       if (!review) return { error: "Review not found", status: 404, code: "REVIEW_NOT_FOUND" };
       if (String(review.user) === self) return { error: "You cannot report your own review", code: "REPORT_OWN" };
-      const place = review.restaurant?.name ? ` · ${review.restaurant.name}` : "";
+      const restaurant = await Restaurant.findById(review.restaurant, "name").lean();
+      const place = restaurant?.name ? ` · ${restaurant.name}` : "";
       return { label: `Review #${review.number ?? ""}${place}`.trim(), owner: review.user };
     }
     case "user": {
@@ -73,39 +75,51 @@ const createReport = asyncHandler(async (req, res) => {
   if (!names.length) return badRequest(res, "Please choose a reason from the list", "REPORT_REASON_REQUIRED");
   const reason = names[0];
 
-  const description = String(req.body.description ?? "").trim();
+  const rawDescription = req.body.description;
+  if (rawDescription !== undefined && rawDescription !== null && typeof rawDescription !== "string") {
+    return badRequest(res, "Description must be text");
+  }
+  const description = String(rawDescription ?? "").trim();
   if (description.length > DESCRIPTION_MAX) {
     return badRequest(res, `Description must be at most ${DESCRIPTION_MAX} characters`);
   }
 
-  const target = await loadTarget(targetType, targetId, req.user._id);
+  const target = await loadTarget(targetType, targetId, req.user);
   if (target.error) {
     return res
       .status(target.status || 400)
       .json({ success: false, message: target.error, ...(target.code ? { code: target.code } : {}) });
   }
 
+  const duplicateReply = () =>
+    res
+      .status(409)
+      .json({ success: false, message: "You have already reported this. We're on it.", code: "REPORT_DUPLICATE" });
   const duplicate = await Report.exists({
     reporter: req.user._id,
     targetType,
     targetId,
     status: { $in: ["open", "in_review"] },
   });
-  if (duplicate) {
-    return res
-      .status(409)
-      .json({ success: false, message: "You have already reported this. We're on it.", code: "REPORT_DUPLICATE" });
-  }
+  if (duplicate) return duplicateReply();
 
-  const report = await Report.create({
-    targetType,
-    targetId,
-    targetLabel: target.label,
-    targetOwner: target.owner || null,
-    reason,
-    description,
-    reporter: req.user._id,
-  });
+  // The unique partial index (one open report per reporter + target) settles
+  // a double tap that passed the check above at the same time.
+  let report;
+  try {
+    report = await Report.create({
+      targetType,
+      targetId,
+      targetLabel: target.label,
+      targetOwner: target.owner || null,
+      reason,
+      description,
+      reporter: req.user._id,
+    });
+  } catch (error) {
+    if (error?.code === 11000) return duplicateReply();
+    throw error;
+  }
 
   // Settings.reportAlerts → tell the admins.
   const settings = await CatalogService.getSettings();

@@ -2,6 +2,8 @@ import { Restaurant, RestaurantView, FavoriteList, Review, User, Taxonomy, MenuI
 import { RECOMMENDATION_KEYS } from "#constants";
 import { DEFAULT_TRENDING_COLLAGE } from "#constants/shared/catalogDefaults.js";
 import { RestaurantQueryService as Q } from "./RestaurantQueryService.js";
+import { MenuService } from "./MenuService.js";
+import { projectTranslations, KIND_LABELS } from "#utils/translations.js";
 
 /**
  * RecommendationService — personal and "what's hot" restaurant sets.
@@ -30,7 +32,7 @@ class RecommendationService {
   // ------------------------------------------------------ recently viewed
 
   /** The user's recently viewed active restaurants, newest first, with viewedAt. */
-  static async recentlyViewed(userId, { limit = 10, settings, near = null } = {}) {
+  static async recentlyViewed(userId, { limit = 10, settings, near = null, lang = "en" } = {}) {
     const rows = await RestaurantView.aggregate([
       { $match: { user: userId, inHistory: true } },
       { $sort: { viewedAt: -1 } },
@@ -40,7 +42,7 @@ class RecommendationService {
     ]);
     return this.inOrder(
       rows.map((r) => r._id),
-      { limit, settings, near, extra: new Map(rows.map((r) => [String(r._id), { viewedAt: r.viewedAt }])) },
+      { limit, settings, near, lang, extra: new Map(rows.map((r) => [String(r._id), { viewedAt: r.viewedAt }])) },
     );
   }
 
@@ -53,11 +55,11 @@ class RecommendationService {
   }
 
   /** Active restaurants for `ids`, in that order (optional per-id extra fields). */
-  static async inOrder(ids, { limit = 10, settings, near = null, extra = null } = {}) {
+  static async inOrder(ids, { limit = 10, settings, near = null, extra = null, lang = "en" } = {}) {
     if (!ids.length) return [];
     const docs = await Restaurant.find({ _id: { $in: ids }, ...Q.ACTIVE }).lean();
     const byId = new Map(docs.map((d) => [String(d._id), d]));
-    const ctx = Q.context(settings, near);
+    const ctx = Q.context(settings, near, lang);
     return ids
       .map((id) => byId.get(String(id)))
       .filter(Boolean)
@@ -178,6 +180,7 @@ class RecommendationService {
           sort: COLLECTIONS[rec.key].sort,
           params: { collection: rec.key },
           requiresAuth: !!COLLECTIONS[rec.key].requiresAuth,
+          translations: rec.translations || {},
         };
         if (rec.key === "trending") {
           const [top, count] = await Promise.all([
@@ -191,9 +194,15 @@ class RecommendationService {
           tile.images = [...photos, ...DEFAULT_TRENDING_COLLAGE].slice(0, 4);
           tile.count = count;
         } else if (rec.key === "bestRated") {
+          // Same order as the collection (sort "rating": liked % with enough reviews).
           const filter = { ...scope, reviewCount: { $gt: 0 } };
-          const [top, count] = await Promise.all([
-            Restaurant.findOne(filter, "coverImages").sort({ rating: -1, reviewCount: -1 }).lean(),
+          const [[top], count] = await Promise.all([
+            Restaurant.aggregate([
+              { $match: filter },
+              ...Q.bestRatedStages(settings),
+              { $limit: 1 },
+              { $project: { coverImages: 1 } },
+            ]),
             Restaurant.countDocuments(filter),
           ]);
           tile.images = top?.coverImages?.slice(0, 1) || [];
@@ -222,9 +231,9 @@ class RecommendationService {
    * cuisines (else the most common nearby) and a popular dish.
    * → [{ type, id, label, subtitle, image, distanceMeters?, etaLabel?, restaurant?, filter }]
    */
-  static async landingSuggestions({ user = null, settings, area, near = null, limit = 4 } = {}) {
+  static async landingSuggestions({ user = null, settings, area, near = null, limit = 4, lang = "en" } = {}) {
     const scope = { ...Q.ACTIVE, ...(area?.filter || {}) };
-    const ctx = Q.context(settings, near);
+    const ctx = Q.context(settings, near, lang);
     const rows = [];
 
     const restaurants = await Restaurant.find(scope)
@@ -243,6 +252,7 @@ class RecommendationService {
       distanceMeters: r.distanceMeters ?? null,
       etaLabel: r.etaLabel ?? null,
       filter: null,
+      translations: projectTranslations(r, { label: "name", address: "address" }, { subtitle: KIND_LABELS.restaurant }),
     });
 
     // Cuisine: a preferred one present nearby, else the most common nearby.
@@ -256,13 +266,11 @@ class RecommendationService {
       : null;
     const closest = cuisine ? presented.find((r) => r.cuisines?.includes(cuisine.name)) : null;
 
-    // Dish: a popular dish of the top restaurants.
+    // Dish: a popular dish of the top restaurants (not in a hidden category).
     const dish = presented.length
-      ? await MenuItem.findOne({
-          restaurant: { $in: presented.map((r) => r._id) },
-          isPopular: true,
-          isAvailable: true,
-        })
+      ? await MenuItem.findOne(
+          await MenuService.visibleItemFilter({ restaurant: { $in: presented.map((r) => r._id) }, isPopular: true }),
+        )
           .sort({ order: 1 })
           .lean()
       : null;
@@ -281,6 +289,7 @@ class RecommendationService {
         distanceMeters: closest?.distanceMeters ?? null,
         etaLabel: closest?.etaLabel ?? null,
         filter: { cuisine: cuisine.name },
+        translations: projectTranslations(cuisine, { label: "name" }, { subtitle: KIND_LABELS.cuisine }),
       });
     }
     if (dish) {
@@ -290,10 +299,13 @@ class RecommendationService {
         label: dish.name,
         subtitle: "Dish",
         image: dish.image || dishRestaurant?.coverImages?.[0] || null,
-        restaurant: dishRestaurant ? { _id: dishRestaurant._id, name: dishRestaurant.name } : null,
+        restaurant: dishRestaurant
+          ? { _id: dishRestaurant._id, name: dishRestaurant.name, translations: projectTranslations(dishRestaurant, { name: "name" }) }
+          : null,
         distanceMeters: dishRestaurant?.distanceMeters ?? null,
         etaLabel: dishRestaurant?.etaLabel ?? null,
         filter: { dish: dish.name },
+        translations: projectTranslations(dish, { label: "name" }, { subtitle: KIND_LABELS.dish }),
       });
     }
     [second, ...rest].filter(Boolean).forEach((r) => rows.push(restaurantRow(r)));

@@ -1,4 +1,5 @@
 import { Schema, Model } from "#constants";
+import { translationsField } from "#utils/translations.js";
 
 /**
  * City — a location the app covers (mobile location sheet, admin restaurant
@@ -42,6 +43,8 @@ const citySchema = new Schema(
     isDefault: { type: Boolean, default: false },
     order: { type: Number, default: 0 },
     isActive: { type: Boolean, default: true },
+    // az / ru names; `name` (English) is what Restaurant.city stores.
+    translations: translationsField(["name", "label", "country"]),
   },
   {
     timestamps: true,

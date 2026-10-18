@@ -1,11 +1,21 @@
-import { dotenv, crypto } from "#lib";
+import { dotenv, crypto, fs } from "#lib";
 
-const NODE_ENV = process.env.NODE_ENV || "development";
+// NODE_ENV may be set only in .env (PM2 / systemd without an env block): peek
+// at it before choosing the environment file, so production detection (Secure
+// cookies, CORS whitelist, https URLs) works either way.
+const envFileNodeEnv = () => {
+  try {
+    return dotenv.parse(fs.readFileSync(".env")).NODE_ENV || "";
+  } catch (_error) {
+    return "";
+  }
+};
+const NODE_ENV = process.env.NODE_ENV || envFileNodeEnv() || "development";
 
 // Load environment-specific file first (e.g. .env.development), then fall back to .env.
 // dotenv does not override already-defined variables, so the first match wins.
 dotenv.config({ path: `.env.${NODE_ENV}` });
-dotenv.config();
+dotenv.config(); // also sets process.env.NODE_ENV when it came from .env
 
 const isProduction = NODE_ENV === "production";
 
@@ -109,6 +119,16 @@ config.mobileApp = {
   linkPaths: ["/list/*", "/restaurant/*", "/invite/*", "/review/*"],
 };
 
+// AI translation of admin content (POST /api/admin/translate) through
+// OpenRouter. Disabled (503 TRANSLATE_NOT_CONFIGURED) without an API key.
+config.openRouter = {
+  apiKey: String(process.env.OPENROUTER_API_KEY || "").trim(),
+  model: String(process.env.OPENROUTER_MODEL || "").trim() || "google/gemini-3.8-flash",
+  // Optional app attribution (HTTP-Referer / X-OpenRouter-Title headers).
+  referer: String(process.env.OPENROUTER_REFERER || "").trim(),
+  title: String(process.env.OPENROUTER_TITLE || "").trim(),
+};
+
 // CORS whitelist (credentials are sent, so production allows HTTPS origins only)
 const corsConfig = {
   origin: isProduction
@@ -125,7 +145,15 @@ const corsConfig = {
   // X-Session-Id: the web landing pages' per-browser id (restaurant view de-duplication).
   // Accept-Language: localized error messages; X-App-Version / X-App-Platform:
   // minimum supported app version check.
-  allowedHeaders: ["Authorization", "Content-Type", "X-Session-Id", "Accept-Language", "X-App-Version", "X-App-Platform"],
+  allowedHeaders: [
+    "Authorization",
+    "Content-Type",
+    "X-Session-Id",
+    "Accept-Language",
+    "X-App-Version",
+    "X-App-Platform",
+    "X-Content-Mode",
+  ],
   exposedHeaders: ["X-API-Version", "Content-Language", "Retry-After"],
   credentials: true,
 };

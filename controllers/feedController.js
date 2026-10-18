@@ -1,4 +1,4 @@
-import { Review, FavoriteList, User } from "#models";
+import { Review, FavoriteList, User, Restaurant } from "#models";
 import { ReviewService } from "#services";
 import { asyncHandler } from "#utils";
 
@@ -8,7 +8,8 @@ import { asyncHandler } from "#utils";
  * Reviews: approved, not stealth, author active and their reviewsVisibility
  * allows followers. Lists: public / collaborative, owner's listsVisibility
  * allows followers. Posts of restaurants that are not public (Trash,
- * pending, suspended…) are skipped.
+ * pending, suspended…) are filtered out in the queries (so a page is never
+ * short and the cursor stays right).
  */
 
 const USER_FIELDS = "firstName lastName avatar verified";
@@ -43,10 +44,13 @@ const getFeed = asyncHandler(async (req, res) => {
   ).lean();
   const reviewAuthors = authors.filter((u) => (u.settings?.reviewsVisibility || "everyone") !== "me");
   const listOwners = authors.filter((u) => (u.settings?.listsVisibility || "everyone") !== "me");
+  // Restaurants that are not public (usually few): their posts never show.
+  const hidden = await Restaurant.distinct("_id", { $or: [{ isDeleted: true }, { status: { $ne: "active" } }] });
 
   const [reviews, lists] = await Promise.all([
     Review.find({
       user: { $in: reviewAuthors.map((u) => u._id) },
+      restaurant: { $nin: hidden },
       isDeleted: false,
       status: "approved",
       isStealth: { $ne: true },
@@ -61,7 +65,8 @@ const getFeed = asyncHandler(async (req, res) => {
       owner: { $in: listOwners.map((u) => u._id) },
       isDeleted: false,
       privacy: { $in: ["public", "collaborative"] },
-      "items.0": { $exists: true },
+      // At least one public restaurant.
+      items: { $elemMatch: { restaurant: { $nin: hidden } } },
       ...(cursor ? { updatedAt: { $lt: cursor } } : {}),
     })
       .sort({ updatedAt: -1 })

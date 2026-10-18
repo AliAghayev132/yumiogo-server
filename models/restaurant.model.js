@@ -4,6 +4,10 @@ import { Schema, Model, restaurantStatus, priceRange, WEEK_DAYS } from "#constan
 import { EncryptionService } from "#services/EncryptionService.js";
 import { computeOpenNow } from "#utils/openingHours.js";
 import { foldText } from "#utils/search.js";
+import { translationsField, allValues } from "#utils/translations.js";
+// Direct import (not the #models barrel) — the city's az / ru names feed the
+// address search key.
+import { City } from "./city.model.js";
 
 /**
  * Restaurant — the core Yumio resource.
@@ -29,6 +33,7 @@ const dishSchema = new Schema(
     image: { type: String, default: null },
     // The MenuItem this entry mirrors.
     item: { type: Schema.Types.ObjectId, ref: "MenuItem", default: null },
+    translations: translationsField(["name"]),
   },
   { _id: false },
 );
@@ -49,12 +54,31 @@ const statsSchema = new Schema(
     reviews30d: { type: Number, default: 0 },
     // Average review score (1..5) of the last 30 days; 0 = no reviews.
     rating30d: { type: Number, default: 0 },
+    // "Liked it" reviews of the last 30 days and their share (0..100) of reviews30d.
+    liked30d: { type: Number, default: 0 },
+    likedPercent30d: { type: Number, default: 0 },
     // Weighted activity scores (views + 2×saves + 3×reviews).
     popularity7d: { type: Number, default: 0 },
     trending30d: { type: Number, default: 0 },
     // This week's activity minus last week's ("On the rise").
     rise: { type: Number, default: 0 },
     updatedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
+// Liked-percentage rating ("bəyəni sistemi"), derived from the same public
+// reviews as rating / reviewCount by ReviewService (recomputeRestaurant /
+// recomputeAll). Clients show likedPercent once total ≥
+// Settings.ratingDisplay.minReviewsForPercent.
+const reviewStatsSchema = new Schema(
+  {
+    total: { type: Number, default: 0 },
+    liked: { type: Number, default: 0 },
+    fine: { type: Number, default: 0 },
+    disliked: { type: Number, default: 0 },
+    // round(liked / total × 100); 0 without reviews.
+    likedPercent: { type: Number, default: 0, min: 0, max: 100 },
   },
   { _id: false },
 );
@@ -77,6 +101,8 @@ const restaurantSchema = new Schema(
       type: String,
       default: "",
     },
+    // az / ru name, description and address; the fields above are English.
+    translations: translationsField(["name", "description", "address"]),
 
     // ----- Categorization -----
     cuisines: {
@@ -208,6 +234,11 @@ const restaurantSchema = new Schema(
       type: Number,
       default: 0,
     },
+    // { total, liked, fine, disliked, likedPercent } — see reviewStatsSchema.
+    reviewStats: {
+      type: reviewStatsSchema,
+      default: () => ({}),
+    },
 
     // ----- Business info -----
     // Weekly opening hours keyed by day (mon..sun) → { open, close } in "HH:mm".
@@ -290,10 +321,12 @@ const restaurantSchema = new Schema(
       type: Date,
       default: null,
     },
-    // Folded (Azerbaijani-letter-insensitive) search keys, derived on save.
+    // Folded (Azerbaijani-letter-insensitive) search keys in every language,
+    // derived on save: name, address + city, text = description.
     search: {
       name: { type: String, default: "" },
       address: { type: String, default: "" },
+      text: { type: String, default: "" },
     },
     isDeleted: {
       type: Boolean,
@@ -353,21 +386,76 @@ restaurantSchema.virtual("hasDiscount").get(function () {
   return this.discountPercent > 0;
 });
 
+// ----- Search keys -----
+// City.name → the city's name in every language ("Baku", "Bakı", "Баку"),
+// cached briefly; refreshSearchKeys() (city rename / translation edits) clears it.
+const CITY_NAMES_TTL_MS = 60 * 1000;
+const cityNamesCache = new Map();
+
+const cityNamesOf = async (name) => {
+  if (!name) return [];
+  const hit = cityNamesCache.get(name);
+  if (hit && Date.now() - hit.at < CITY_NAMES_TTL_MS) return hit.names;
+  const city = await City.findOne({ name }, "name translations").lean();
+  const names = city ? allValues(city, "name") : [name];
+  cityNamesCache.set(name, { at: Date.now(), names });
+  return names;
+};
+
+// Folded (Azerbaijani-letter-insensitive) keys in every language: a search in
+// Azerbaijani or Russian finds the place (and its city) too. Catalog names
+// (cuisines, features, …) and the menu are matched at query time
+// (RestaurantQueryService.textQuery), so their translations never go stale here.
+const searchKeysOf = (doc, cityNames = []) => ({
+  name: foldText(allValues(doc, "name").join(" ")),
+  address: foldText([...allValues(doc, "address"), ...cityNames].filter(Boolean).join(" ")),
+  text: foldText(allValues(doc, "description").join(" ")),
+});
+const SEARCH_KEYS = ["name", "address", "text"];
+
 // ----- Pre-save hook: auto slug + derived openNow / search keys / publishedAt -----
 // Mongoose 9 uses sync/promise-style middleware (no `next` callback).
-restaurantSchema.pre("save", function () {
+restaurantSchema.pre("save", async function () {
   if (!this.slug && this.name) {
     const base = EncryptionService.generateSlug(this.name);
     const suffix = Math.random().toString(36).slice(2, 7);
     this.slug = `${base}-${suffix}`;
   }
   this.openNow = computeOpenNow(this);
-  this.search = {
-    name: foldText(this.name),
-    address: foldText([this.address, this.city].filter(Boolean).join(" ")),
-  };
+  this.search = searchKeysOf(this, await cityNamesOf(this.city));
   if (this.status === "active" && !this.publishedAt) this.publishedAt = new Date();
 });
+
+// insertMany skips the save hook: derive the search keys here
+// (bulk imports); the boot refreshSearchKeys() catches anything else.
+restaurantSchema.pre("insertMany", async function (docs) {
+  for (const doc of [].concat(docs || [])) {
+    if (doc && typeof doc === "object") doc.search = searchKeysOf(doc, await cityNamesOf(doc.city));
+  }
+});
+
+/**
+ * Recompute the search keys of the restaurants matching `filter` (bulk, no
+ * save hooks / timestamps) — after a city rename or a change of its az / ru
+ * names, or for documents written with updateMany. Only changed keys are
+ * written. → number of restaurants updated
+ */
+restaurantSchema.statics.refreshSearchKeys = async function (filter = {}) {
+  cityNamesCache.clear();
+  const docs = await this.find(filter, "name description address city translations search").lean();
+  if (!docs.length) return 0;
+  const names = new Map();
+  for (const city of new Set(docs.map((d) => d.city))) names.set(city, await cityNamesOf(city));
+  const ops = [];
+  docs.forEach((d) => {
+    const search = searchKeysOf(d, names.get(d.city) || []);
+    if (SEARCH_KEYS.every((key) => search[key] === d.search?.[key])) return;
+    ops.push({ updateOne: { filter: { _id: d._id }, update: { $set: { search } }, timestamps: false } });
+  });
+  if (!ops.length) return 0;
+  const res = await this.bulkWrite(ops, { ordered: false });
+  return res.modifiedCount;
+};
 
 // Geo lists use $geoNear through RestaurantQueryService (a find() with $near
 // cannot be counted or re-sorted).

@@ -48,4 +48,17 @@ const sanitizeInput = (req, _res, next) => {
   next();
 };
 
-export { sanitizeInput, sanitize };
+/**
+ * Keep the raw value of body `field` as req.rawBody[field] before
+ * sanitizeInput drops dotted keys from it — for payloads whose keys are
+ * opaque labels that never reach a query (AI translation: "sections.2.body").
+ * The route must validate the copy itself.
+ */
+const keepRawBodyField = (field) => (req, _res, next) => {
+  if (req.body && typeof req.body === "object" && Object.hasOwn(req.body, field)) {
+    req.rawBody = { ...(req.rawBody || {}), [field]: req.body[field] };
+  }
+  next();
+};
+
+export { sanitizeInput, sanitize, keepRawBodyField };

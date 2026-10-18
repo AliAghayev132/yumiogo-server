@@ -1,4 +1,4 @@
-import { Comment, Review, User } from "#models";
+import { Comment, Review, User, Notification } from "#models";
 import { COMMENT_MAX_LENGTH } from "#models/comment.model.js";
 import { ReviewService, CatalogService } from "#services";
 import { asyncHandler } from "#utils";
@@ -37,23 +37,34 @@ const populateComment = (query) =>
     .populate("replyTo", USER_FIELDS)
     .populate("mentions", USER_FIELDS);
 
-/** Comment → API shape for `viewer` (deleted ones become placeholders). */
-const toComment = (comment, viewer, review) => {
+const idOf = (value) => String(value?._id ?? value ?? "");
+
+/**
+ * Comment → API shape for `viewer` (deleted ones become placeholders).
+ * `maskAuthor`: the review's author is anonymous for this viewer (stealth
+ * review / private account, ReviewService.hidesAuthor) — their comments,
+ * the replies to them and their @mentions don't reveal who they are.
+ */
+const toComment = (comment, viewer, review, maskAuthor = false) => {
   const c = typeof comment.toObject === "function" ? comment.toObject() : comment;
   const viewerId = String(viewer._id);
   const authorId = String(c.user?._id ?? c.user);
   const isMine = authorId === viewerId;
-  const isReviewAuthor = review && String(review.user?._id ?? review.user) === viewerId;
+  const reviewAuthorId = review ? idOf(review.user) : "";
+  const isReviewAuthor = !!review && reviewAuthorId === viewerId;
+  const masked = (u) => maskAuthor && !!reviewAuthorId && idOf(u) === reviewAuthorId;
+  const card = (u) => (masked(u) ? null : publicUser(u));
   return {
     _id: c._id,
     review: c.review,
     parent: c.parent ?? null,
-    user: c.isDeleted ? null : publicUser(c.user),
-    replyTo: c.isDeleted ? null : publicUser(c.replyTo),
-    mentions: c.isDeleted ? [] : (c.mentions || []).map(publicUser).filter(Boolean),
+    user: c.isDeleted ? null : card(c.user),
+    isAnonymous: !c.isDeleted && masked(c.user),
+    replyTo: c.isDeleted ? null : card(c.replyTo),
+    mentions: c.isDeleted ? [] : (c.mentions || []).map(card).filter(Boolean),
     text: c.isDeleted ? "" : c.text,
     isDeleted: !!c.isDeleted,
-    likeCount: c.likeCount || 0,
+    likeCount: Math.max(0, c.likeCount || 0),
     likedByMe: (c.likes || []).some((id) => String(id) === viewerId),
     replyCount: c.replyCount || 0,
     isMine,
@@ -67,6 +78,37 @@ const toComment = (comment, viewer, review) => {
 const visibleFilter = async (extra) => {
   const hidden = await ReviewService.hiddenAuthorIds();
   return hidden.length ? { ...extra, user: { $nin: hidden } } : extra;
+};
+
+/**
+ * Send comment activity notifications (`items`: [{ recipient, type, message }]).
+ * When the actor is the review's author and the review hides its author from
+ * a recipient (stealth / private account, ReviewService.hidesAuthor), that
+ * recipient gets the notification without the actor (data.anonymous).
+ */
+const sendActivity = async (items, { actor, review, comment, data = {} }) => {
+  if (!items.length) return;
+  const actorIsAuthor = idOf(actor) === idOf(review.user);
+  let recipients = new Map();
+  if (actorIsAuthor) {
+    const users = await User.find({ _id: { $in: items.map((i) => i.recipient) } }, "following role").lean();
+    recipients = new Map(users.map((u) => [String(u._id), u]));
+  }
+  items.forEach(({ recipient, type, message }) => {
+    const viewer = recipients.get(String(recipient)) || { _id: recipient };
+    const anonymous = actorIsAuthor && ReviewService.hidesAuthor(review, viewer, actor);
+    ReviewService.notify({
+      recipient,
+      actor: anonymous ? null : actor._id,
+      type,
+      fallbackType: "review",
+      message,
+      review: review._id,
+      comment,
+      restaurant: review.restaurant,
+      data: anonymous ? { ...data, anonymous: true } : data,
+    });
+  });
 };
 
 /**
@@ -93,29 +135,32 @@ const listComments = asyncHandler(async (req, res) => {
     Comment.countDocuments(filter),
   ]);
 
-  const replyFilter = await visibleFilter({
-    parent: { $in: comments.map((c) => c._id) },
-    isDeleted: false,
-  });
-  const replies = repliesPerComment
-    ? await populateComment(Comment.find(replyFilter).sort({ createdAt: 1 }))
-    : [];
+  // First replies of each thread: one indexed, limited query per parent
+  // (parent, createdAt) — never every reply of the page.
   const byParent = new Map();
-  replies.forEach((reply) => {
-    const key = String(reply.parent);
-    const list = byParent.get(key) || [];
-    if (list.length < repliesPerComment) list.push(reply);
-    byParent.set(key, list);
-  });
+  if (repliesPerComment) {
+    const withReplies = comments.filter((c) => (c.replyCount || 0) > 0);
+    const lists = await Promise.all(
+      withReplies.map(async (c) =>
+        populateComment(
+          Comment.find(await visibleFilter({ parent: c._id, isDeleted: false }))
+            .sort({ createdAt: 1 })
+            .limit(repliesPerComment),
+        ),
+      ),
+    );
+    withReplies.forEach((c, i) => byParent.set(String(c._id), lists[i]));
+  }
+  const mask = await ReviewService.hidesAuthorFrom(review, req.user);
 
   res.json({
     success: true,
     data: {
       comments: comments.map((c) => ({
-        ...toComment(c, req.user, review),
-        replies: (byParent.get(String(c._id)) || []).map((r) => toComment(r, req.user, review)),
+        ...toComment(c, req.user, review, mask),
+        replies: (byParent.get(String(c._id)) || []).map((r) => toComment(r, req.user, review, mask)),
       })),
-      commentCount: review.commentCount || 0,
+      commentCount: Math.max(0, review.commentCount || 0),
       pagination: pagination(params, total),
     },
   });
@@ -134,14 +179,15 @@ const listReplies = asyncHandler(async (req, res) => {
 
   const params = pageParams(req.query);
   const filter = await visibleFilter({ parent: parent._id, isDeleted: false });
-  const [replies, total] = await Promise.all([
+  const [replies, total, mask] = await Promise.all([
     populateComment(Comment.find(filter).sort({ createdAt: 1 }).skip(params.skip).limit(params.limit)),
     Comment.countDocuments(filter),
+    ReviewService.hidesAuthorFrom(review, req.user),
   ]);
   res.json({
     success: true,
     data: {
-      replies: replies.map((r) => toComment(r, req.user, review)),
+      replies: replies.map((r) => toComment(r, req.user, review, mask)),
       pagination: pagination(params, total),
     },
   });
@@ -158,7 +204,11 @@ const createComment = asyncHandler(async (req, res) => {
   const review = await ReviewService.findVisible(req.params.id, req.user, { populate: false });
   if (!review) return notFound(res, "Review not found", "REVIEW_NOT_FOUND");
 
-  const text = String(req.body?.text ?? "").trim();
+  const rawText = req.body?.text;
+  if (rawText !== undefined && rawText !== null && typeof rawText !== "string") {
+    return badRequest(res, "Comment text must be text", "COMMENT_REQUIRED");
+  }
+  const text = String(rawText ?? "").trim();
   if (!text) return badRequest(res, "Comment text is required", "COMMENT_REQUIRED");
   if (text.length > COMMENT_MAX_LENGTH) {
     return badRequest(res, `Comments must be at most ${COMMENT_MAX_LENGTH} characters`, "COMMENT_TOO_LONG");
@@ -198,30 +248,25 @@ const createComment = asyncHandler(async (req, res) => {
   if (root) await Comment.updateOne({ _id: root }, { $inc: { replyCount: 1 } }, { timestamps: false });
 
   // Notifications (one per person, never to yourself).
+  const queue = [];
   const notified = new Set([String(req.user._id)]);
-  const send = (recipient, type, message) => {
+  const add = (recipient, type, message) => {
     if (!recipient || notified.has(String(recipient))) return;
     notified.add(String(recipient));
-    ReviewService.notify({
-      recipient,
-      actor: req.user._id,
-      type,
-      fallbackType: "review",
-      message,
-      review: review._id,
-      comment: comment._id,
-      restaurant: review.restaurant,
-    });
+    queue.push({ recipient, type, message });
   };
-  if (replyTo) send(replyTo, "reply", "replied to your comment.");
-  send(review.user, "comment", "commented on your review.");
-  mentions.forEach((id) => send(id, "mention", "mentioned you in a comment."));
+  if (replyTo) add(replyTo, "reply", "replied to your comment.");
+  add(review.user, "comment", "commented on your review.");
+  mentions.forEach((id) => add(id, "mention", "mentioned you in a comment."));
+  await sendActivity(queue, { actor: req.user, review, comment: comment._id });
 
   const fresh = await populateComment(Comment.findById(comment._id));
   res.status(201).json({
     success: true,
     message: "Comment added",
-    data: { comment: { ...toComment(fresh, req.user, review), replies: [] } },
+    data: {
+      comment: { ...toComment(fresh, req.user, review, await ReviewService.hidesAuthorFrom(review, req.user)), replies: [] },
+    },
   });
 });
 
@@ -252,17 +297,18 @@ const toggleCommentLike = asyncHandler(async (req, res) => {
         options,
       );
   if (result && wantLiked) {
-    ReviewService.notify({
-      recipient: comment.user,
-      actor: uid,
-      type: "review",
-      message: "liked your comment.",
-      review: review._id,
+    // Deduped per (actor, comment) — see Notification DEDUPE_TYPES.
+    sendActivity([{ recipient: comment.user, type: "comment_like", message: "liked your comment." }], {
+      actor: req.user,
+      review,
       comment: comment._id,
-      restaurant: review.restaurant,
       data: { reason: "comment_like" },
-      dedupe: true,
     });
+  } else if (result) {
+    // Unliked → the "liked your comment" notice goes away (incl. legacy "review" rows).
+    Notification.retract({ type: { $in: ["comment_like", "review"] }, actor: uid, comment: comment._id }).catch(
+      () => {},
+    );
   }
   const likeCount = result
     ? Math.max(0, result.likeCount)
@@ -292,6 +338,13 @@ const deleteComment = asyncHandler(async (req, res) => {
   );
   let commentCount = review?.commentCount || 0;
   if (done.modifiedCount) {
+    // Its reply / mention / like notifications point at nothing now.
+    Notification.retract({ comment: comment._id }).catch(() => {});
+  }
+  // Comments of hidden authors are already left out of the counters
+  // (ReviewService.recountActivityOf) — don't subtract them twice.
+  const authorHidden = (await ReviewService.hiddenAuthorSet()).has(String(comment.user));
+  if (done.modifiedCount && !authorHidden) {
     const updated = await Review.findOneAndUpdate({ _id: comment.review }, decrement("commentCount"), {
       returnDocument: "after",
       timestamps: false,

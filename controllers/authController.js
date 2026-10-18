@@ -18,6 +18,7 @@ import {
 
 // Utils
 import { asyncHandler } from "#utils";
+import { crypto } from "#lib";
 
 // Config
 import { config } from "#config";
@@ -25,8 +26,9 @@ import { config } from "#config";
 // Constants
 import { uploadPaths } from "#constants";
 
-// Raster formats only for avatars (no SVG: it can carry scripts).
-const AVATAR_MIME = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif"];
+// Raster formats only for avatars (no SVG: it can carry scripts). The same set
+// FileService accepts by magic bytes — no HEIC (the app converts to JPEG).
+const AVATAR_MIME = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 const NAME_MAX = 50;
 const BIO_MAX = 160;
 
@@ -122,27 +124,28 @@ const cleanPreferences = async (preferences) => {
   return { cuisines: cuisines.names.slice(0, 50), dietary: dietary.names.slice(0, 50) };
 };
 
+const secondsUntil = (date) => Math.max(1, Math.ceil((new Date(date).getTime() - Date.now()) / 1000));
+
 /**
  * Send a code and answer with the OTP meta, or the right error.
  * `softCooldown`: re-submitting the form inside the resend cooldown keeps the
- * code already e-mailed (still valid) instead of failing with 429.
+ * code already e-mailed (still valid) instead of failing with 429. The
+ * pending payload is never touched here: the caller decides which payload a
+ * code is bound to (see register).
+ * `extra`: more fields for the success `data` (e.g. registrationId).
  */
 const sendCode = async (res, email, type, data, message, options = {}) => {
-  const { softCooldown = false } = options;
+  const { softCooldown = false, extra = {} } = options;
   if (!mailAvailable()) return mailUnavailable(res);
 
   const issued = await OTP.issue(email, type, data);
   if (issued.errorCode === "OTP_COOLDOWN" && softCooldown) {
-    const pending = await OTP.findOneAndUpdate(
-      { email, type, verified: false },
-      { $set: { data } },
-      { returnDocument: "after" },
-    );
-    if (pending?.codeExpiresAt > new Date()) {
+    const pending = await OTP.findPending(email, type);
+    if (pending && !pending.verified && pending.codeExpiresAt > new Date()) {
       return res.json({
         success: true,
         message: "We already sent you a code. Check your email",
-        data: { email, ...OTP.meta(pending) },
+        data: { email, ...OTP.meta(pending), ...extra },
       });
     }
   }
@@ -163,7 +166,7 @@ const sendCode = async (res, email, type, data, message, options = {}) => {
   return res.json({
     success: true,
     message,
-    data: { email, ...OTP.meta(issued.otp) },
+    data: { email, ...OTP.meta(issued.otp), ...extra },
   });
 };
 
@@ -270,29 +273,59 @@ const register = asyncHandler(async (req, res) => {
     cleanPreferences(body.preferences),
   ]);
 
+  // A code that is still valid stays bound to the payload it was sent for:
+  // nobody can swap the password (or anything else) of a pending sign-up for
+  // an address they don't own and wait for the owner to type the code. Only a
+  // caller who knows the pending password may edit the form (typo fixes).
+  let registrationId = crypto.randomBytes(16).toString("hex");
+  const pending = await OTP.findPending(email, "register");
+  if (pending && !pending.verified && pending.codeExpiresAt > new Date() && pending.data?.hashedPassword) {
+    const samePerson = await HashService.comparePassword(body.password, pending.data.hashedPassword);
+    if (!samePerson) {
+      const retryAfter = secondsUntil(pending.codeExpiresAt);
+      res.set("Retry-After", String(retryAfter));
+      return fail(res, 429, "We already sent a code to this email. Enter it, or try again later", "OTP_COOLDOWN", {
+        retryAfter,
+      });
+    }
+    registrationId = pending.data.registrationId || registrationId;
+  }
+
+  const payload = {
+    firstName: cleanName(body.firstName),
+    lastName: cleanName(body.lastName),
+    phone,
+    hashedPassword,
+    termsVersion:
+      typeof body.termsVersion === "string" && body.termsVersion.length <= 64 ? body.termsVersion : termsVersion,
+    termsAcceptedAt: new Date().toISOString(),
+    inviteCode: typeof body.inviteCode === "string" ? body.inviteCode.slice(0, 16) : null,
+    preferences,
+    language: pickLanguage(body.language),
+    // Clients that send it back on verify / resend can never complete a
+    // sign-up somebody else started for the same address.
+    registrationId,
+  };
+
+  // Same person editing the form inside the resend cooldown: the code already
+  // e-mailed now carries the edited payload (only if it is still that code).
+  if (pending?.data?.hashedPassword && pending.codeExpiresAt > new Date()) {
+    await OTP.updateOne({ _id: pending._id, codeHash: pending.codeHash, verified: false }, { $set: { data: payload } });
+  }
+
   // Everything waits in the OTP payload until the code is verified.
-  return sendCode(
-    res,
-    email,
-    "register",
-    {
-      firstName: cleanName(body.firstName),
-      lastName: cleanName(body.lastName),
-      phone,
-      hashedPassword,
-      termsVersion:
-        typeof body.termsVersion === "string" && body.termsVersion.length <= 64
-          ? body.termsVersion
-          : termsVersion,
-      termsAcceptedAt: new Date().toISOString(),
-      inviteCode: typeof body.inviteCode === "string" ? body.inviteCode.slice(0, 16) : null,
-      preferences,
-      language: pickLanguage(body.language),
-    },
-    "Verification code sent to your email",
-    { softCooldown: true },
-  );
+  return sendCode(res, email, "register", payload, "Verification code sent to your email", {
+    softCooldown: true,
+    extra: { registrationId },
+  });
 });
+
+/** The optional registrationId of a verify / resend call does not match the pending sign-up. */
+const registrationMismatch = (body, data) =>
+  typeof body?.registrationId === "string" &&
+  !!body.registrationId &&
+  !!data?.registrationId &&
+  body.registrationId !== data.registrationId;
 
 /**
  * Step 3: verify the code and create the account.
@@ -305,6 +338,12 @@ const verifyOTP = asyncHandler(async (req, res) => {
     return fail(res, 400, "Email and verification code are required", "OTP_REQUIRED");
   }
 
+  // A newer sign-up for this address replaced the one this client started.
+  const pending = await OTP.findPending(email, "register");
+  if (pending && registrationMismatch(req.body, pending.data)) {
+    return fail(res, 400, "Code not found or expired. Request a new code", "OTP_NOT_FOUND");
+  }
+
   const verification = await OTP.verifyCode(email, code, "register");
   if (!verification.valid) {
     return fail(res, 400, verification.error, verification.errorCode, {
@@ -313,7 +352,7 @@ const verifyOTP = asyncHandler(async (req, res) => {
   }
 
   const data = verification.data;
-  if (!data?.hashedPassword) {
+  if (!data?.hashedPassword || registrationMismatch(req.body, data)) {
     await OTP.deleteMany({ email, type: "register" });
     return fail(res, 400, "Code not found or expired. Request a new code", "OTP_NOT_FOUND");
   }
@@ -380,10 +419,13 @@ const resendOTP = asyncHandler(async (req, res) => {
   if (type === "reset-password") return forgotPassword(req, res);
 
   const pending = await OTP.findPending(email, "register");
-  if (!pending?.data?.hashedPassword) {
+  if (!pending?.data?.hashedPassword || registrationMismatch(req.body, pending.data)) {
     return fail(res, 400, "No pending verification found. Please start again", "OTP_NOT_FOUND");
   }
-  return sendCode(res, email, "register", pending.data, "A new verification code has been sent");
+  // The new code stays bound to the stored payload.
+  return sendCode(res, email, "register", pending.data, "A new verification code has been sent", {
+    extra: pending.data.registrationId ? { registrationId: pending.data.registrationId } : {},
+  });
 });
 
 // ------------------------------------------------------------------ login
@@ -470,6 +512,16 @@ const googleSignIn = asyncHandler(async (req, res) => {
       if (!byEmail.avatar && profile.picture) byEmail.avatar = profile.picture;
       user = byEmail;
     } else {
+      // A new account needs an address Google vouches for: otherwise anyone
+      // could pre-register (and keep a Google login on) someone else's e-mail.
+      if (!profile.emailVerified) {
+        return fail(
+          res,
+          403,
+          "Google has not verified this email address. Sign up with your email instead",
+          "GOOGLE_EMAIL_UNVERIFIED",
+        );
+      }
       if (acceptTerms === false) {
         return fail(res, 400, "Please accept the Privacy Policy to continue", "TERMS_REQUIRED");
       }
@@ -554,9 +606,12 @@ const logout = asyncHandler(async (req, res) => {
   const everywhere = req.path.endsWith("/logout-all") || req.body?.allDevices === true;
   const device = !everywhere && (await AuthTokenService.endSession(req.user._id, req.body?.refreshToken));
 
-  const update = device ? {} : { $inc: { tokenVersion: 1 }, $set: { refreshSessions: [] } };
-  if (typeof req.body?.pushToken === "string") update.$pull = { pushTokens: req.body.pushToken };
-  if (Object.keys(update).length) await User.updateOne({ _id: req.user._id }, update);
+  if (!device) {
+    // Every device: tokens, refresh families, push tokens and live sockets.
+    await AuthTokenService.revokeAll(req.user._id);
+  } else if (typeof req.body?.pushToken === "string") {
+    await User.updateOne({ _id: req.user._id }, { $pull: { pushTokens: req.body.pushToken } });
+  }
 
   res.clearCookie(config.accessCookieName, config.cookie);
   res.clearCookie(config.refreshCookieName, config.cookie);
@@ -578,8 +633,12 @@ const getMe = asyncHandler(async (req, res) => {
 
 /**
  * Change password (while logged in). Google-only accounts can set a first
- * password without `currentPassword`.
- * PUT|POST /api/auth/change-password  { currentPassword, newPassword }
+ * password without `currentPassword`, but only right after signing in
+ * (access token of a sign-in < 10 min old) — a stolen / left-open session
+ * cannot add a password to the account. Otherwise 400 REAUTH_REQUIRED (sign
+ * in with Google again, or use "Forgot password").
+ * Every other session is signed out; this device gets new tokens.
+ * PUT|POST /api/auth/change-password  { currentPassword, newPassword, pushToken? }
  */
 const changePassword = asyncHandler(async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
@@ -606,11 +665,28 @@ const changePassword = asyncHandler(async (req, res) => {
         "PASSWORD_REUSED",
       );
     }
+  } else {
+    const header = req.header("Authorization");
+    const accessToken = header?.startsWith("Bearer ") ? header.slice(7) : "";
+    if (!AuthTokenService.isRecentSignIn(accessToken)) {
+      return fail(
+        res,
+        400,
+        "For your security, sign in again and then set your password",
+        "REAUTH_REQUIRED",
+      );
+    }
   }
 
-  user.password = await HashService.hashPassword(newPassword);
-  user.tokenVersion += 1; // invalidate existing sessions
-  await user.save();
+  // Invalidate every existing session (sockets / push tokens included); keep
+  // this device's push token when it says which one it is.
+  const password = await HashService.hashPassword(newPassword);
+  const ownPush = typeof req.body?.pushToken === "string" ? req.body.pushToken : null;
+  user.tokenVersion = await AuthTokenService.revokeAll(user._id, {
+    set: { password },
+    keepPushTokens: ownPush && (user.pushTokens || []).includes(ownPush) ? [ownPush] : [],
+  });
+  user.password = password;
 
   const tokens = await issueTokens(res, user);
 
@@ -622,28 +698,50 @@ const changePassword = asyncHandler(async (req, res) => {
 });
 
 /**
+ * Issue + e-mail a reset code in the background (forgotPassword). Cooldown /
+ * send-limit refusals and delivery failures are only logged: the caller's
+ * answer never depends on them.
+ */
+const deliverResetCode = async (email, userId, lang) => {
+  const issued = await OTP.issue(email, "reset-password", { userId });
+  if (issued.error) return;
+  const sent = await MailService.sendOTP(
+    email,
+    issued.code,
+    "reset-password",
+    Math.round(OTP_POLICY.CODE_TTL / 60),
+    lang,
+  );
+  if (!sent.success) {
+    await OTP.rollbackSend(issued.otp);
+    console.error("❌ Reset code e-mail failed:", sent.error || "unknown error");
+  }
+};
+
+/**
  * Forgot password - Step 1: send a code
  * POST /api/auth/forgot-password  { email }
+ * The answer is the same for every address (registered or not, cooldown or
+ * send limit reached): no account enumeration through the message, the
+ * status or the response time — the code is sent in the background.
  */
 async function forgotPassword(req, res) {
   const email = AccountService.normalizeEmail(req.body?.email);
   if (!email) return fail(res, 400, "Please enter a valid email address", "EMAIL_INVALID");
   if (!mailAvailable()) return mailUnavailable(res);
 
-  const user = await User.findOne({ email, isDeleted: false }).select("_id status language");
-
-  // Same answer for unknown addresses (no account enumeration).
-  if (!user) {
-    return res.json({
-      success: true,
-      message: "If this email exists, a reset code has been sent",
-      data: { email, ...OTP.meta(null), resendIn: OTP_POLICY.RESEND_COOLDOWN },
-    });
+  const user = await User.findOne({ email, isDeleted: false }).select("_id language");
+  if (user) {
+    const lang = req.langExplicit ? req.lang : user.language || req.lang;
+    deliverResetCode(email, String(user._id), lang).catch((error) =>
+      console.error("❌ Reset code failed:", error.message),
+    );
   }
 
-  return sendCode(res, email, "reset-password", { userId: String(user._id) }, "Reset code sent to your email", {
-    softCooldown: true,
-    lang: user.language,
+  return res.json({
+    success: true,
+    message: "If this email is registered, we sent a reset code to it",
+    data: { email, ...OTP.meta(null), resendIn: OTP_POLICY.RESEND_COOLDOWN },
   });
 }
 
@@ -712,8 +810,14 @@ const resetPassword = asyncHandler(async (req, res) => {
   }
 
   user.password = await HashService.hashPassword(newPassword);
-  user.tokenVersion = (user.tokenVersion || 0) + 1;
+  // The inbox owner just proved control of the address: a Google login on an
+  // account created through Google is dropped (it may have been opened before
+  // Google-verified addresses were required). The owner's own Google sign-in
+  // re-links it automatically (verified e-mail).
+  if (user.googleId && user.authProvider === "google") user.googleId = undefined;
   await user.save();
+  // Sign out everywhere: tokens, refresh families, push tokens, sockets.
+  await AuthTokenService.revokeAll(user._id);
 
   res.json({ success: true, message: "Password reset successfully" });
 });
@@ -754,7 +858,10 @@ const updateProfile = asyncHandler(async (req, res) => {
     if (bio.length > BIO_MAX) return fail(res, 400, `Bio must be at most ${BIO_MAX} characters`, "BIO_TOO_LONG");
     user.bio = bio;
   }
-  if (body.city !== undefined) {
+  // An unchanged value is kept even when that city was renamed or removed
+  // from the catalog since (the client re-sends what it got).
+  const sameCity = String(body.city ?? "").trim().toLowerCase() === String(user.city ?? "").trim().toLowerCase();
+  if (body.city !== undefined && !sameCity) {
     const resolved = await CatalogService.resolveCity(body.city || "", { keep: user.city });
     if (resolved.unknown) return fail(res, 400, `Unknown city: ${resolved.unknown}`, "CITY_INVALID");
     user.city = resolved.name;
@@ -788,7 +895,7 @@ const updateAvatar = asyncHandler(async (req, res) => {
     return fail(res, 400, "Avatar file is required", "AVATAR_REQUIRED");
   }
   if (!AVATAR_MIME.includes(file.mimetype)) {
-    return fail(res, 400, "Avatar must be a JPG, PNG, WEBP, GIF or HEIC image", "AVATAR_TYPE");
+    return fail(res, 400, "Avatar must be a JPG, PNG, WEBP or GIF image", "AVATAR_TYPE");
   }
 
   const user = await User.findById(req.user._id);

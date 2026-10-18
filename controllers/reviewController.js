@@ -1,7 +1,8 @@
-import { Review, Restaurant, User, FavoriteList, ReviewLabelRequest, Taxonomy, Notification } from "#models";
-import { SENTIMENT_SCORE, REVIEW_LIMITS } from "#models/review.model.js";
+import { Review, Restaurant, User, FavoriteList, ReviewLabelRequest, Taxonomy, Notification, MenuItem } from "#models";
+import { SENTIMENT_SCORE, REVIEW_LIMITS, REVIEW_COOLDOWN_MS } from "#models/review.model.js";
 import { ReviewService, CatalogService } from "#services";
 import { asyncHandler, escapeRegex } from "#utils";
+import { allValues, projectTranslations, translated } from "#utils/translations.js";
 import { mongoose } from "#lib";
 
 /**
@@ -38,11 +39,79 @@ const SORTS = {
 
 const DAY = 24 * 60 * 60 * 1000;
 
+const restaurantNotFound = (res) => notFound(res, "Restaurant not found", "RESTAURANT_NOT_FOUND");
+// One new review per user per restaurant per 24 h (retryAfter: seconds).
+const reviewTooSoon = (res, retryAfter) => {
+  res.set("Retry-After", String(retryAfter));
+  return res.status(429).json({
+    success: false,
+    message: "You already reviewed this restaurant in the last 24 hours. You can edit that review or post a new one later.",
+    code: "REVIEW_TOO_SOON",
+    retryAfter,
+  });
+};
+
+// Text fields must be strings (an object would be stored as "[object Object]").
+const isTextOrEmpty = (value) => value === undefined || value === null || typeof value === "string";
+
+/** Name of a menu item in every language, lower-cased (dish matching). */
+const dishNames = (item) => allValues(item, "name").map((v) => v.trim().toLowerCase());
+
+/**
+ * Favourite dishes → stored shape. The app sends the dish name in the user's
+ * language and, when picked from the menu, `menuItem`. A menu item of THIS
+ * restaurant (by id, or by its name in any language) is stored with its
+ * canonical English name and copies of its az / ru names, so every reader
+ * sees it in their language; unknown names stay free text.
+ * → { dishes } | { error }
+ */
+const resolveDishes = async (raw, restaurantId) => {
+  const entries = [];
+  for (const entry of Array.isArray(raw) ? raw : []) {
+    const name = cleanName(typeof entry === "string" ? entry : typeof entry?.name === "string" ? entry.name : "");
+    const menuItem = entry && typeof entry === "object" && isObjectId(entry.menuItem) ? String(entry.menuItem) : null;
+    if (!name && !menuItem) continue;
+    if (name.length > 80) return { error: "Dish names must be at most 80 characters" };
+    entries.push({ name, menuItem });
+  }
+  if (!entries.length) return { dishes: [] };
+
+  const items = isObjectId(restaurantId)
+    ? await MenuItem.find({ restaurant: restaurantId }, "name translations").lean()
+    : [];
+  const byId = new Map(items.map((item) => [String(item._id), item]));
+  const byName = new Map();
+  items.forEach((item) =>
+    dishNames(item).forEach((key) => {
+      if (!byName.has(key)) byName.set(key, item);
+    }),
+  );
+
+  const dishes = [];
+  const seen = new Set();
+  for (const { name, menuItem } of entries) {
+    // A menu item of another restaurant (or a deleted one) is not linked.
+    const item = (menuItem && byId.get(menuItem)) || (name ? byName.get(name.toLowerCase()) : null) || null;
+    if (!item && !name) continue;
+    const key = item ? `id:${item._id}` : `name:${name.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dishes.push(
+      item
+        ? { name: item.name, menuItem: item._id, translations: projectTranslations(item, { name: "name" }) }
+        : { name, menuItem: null },
+    );
+  }
+  return { dishes };
+};
+
 /**
  * Validate the composer fields present in `body` (create: sentiment required).
- * → { fields } (only the provided keys, normalised) | { error, code? }
+ * `user` = the author (companions must be people they follow or who follow
+ * them). → { fields } (only the provided keys, normalised) | { error, code? }
  */
-const buildFields = async (body, { userId, existing = null, isCreate = false }) => {
+const buildFields = async (body, { user, restaurant, existing = null, isCreate = false }) => {
+  const userId = user._id;
   const fields = {};
 
   if (body.sentiment !== undefined || isCreate) {
@@ -74,8 +143,23 @@ const buildFields = async (body, { userId, existing = null, isCreate = false }) 
     if (others.length > REVIEW_LIMITS.companions) {
       return { error: `At most ${REVIEW_LIMITS.companions} tagged friends` };
     }
-    // Unknown / inactive users are silently dropped.
-    const users = await User.find({ _id: { $in: others }, isDeleted: false, status: "active" }, "_id").lean();
+    // Only people I follow or who follow me (or already tagged); unknown /
+    // inactive / unrelated users are silently dropped.
+    const users = others.length
+      ? await User.find(
+          {
+            _id: { $in: others },
+            isDeleted: false,
+            status: "active",
+            $or: [
+              { _id: { $in: user.following || [] } },
+              { following: userId },
+              { _id: { $in: existing?.companions || [] } },
+            ],
+          },
+          "_id",
+        ).lean()
+      : [];
     const valid = new Set(users.map((u) => String(u._id)));
     fields.companions = others.filter((id) => valid.has(id));
   }
@@ -90,19 +174,8 @@ const buildFields = async (body, { userId, existing = null, isCreate = false }) 
   }
 
   if (body.favoriteDishes !== undefined) {
-    const raw = Array.isArray(body.favoriteDishes) ? body.favoriteDishes : [];
-    const dishes = [];
-    const seen = new Set();
-    for (const entry of raw) {
-      const name = cleanName(typeof entry === "string" ? entry : entry?.name);
-      if (!name) continue;
-      if (name.length > 80) return { error: "Dish names must be at most 80 characters" };
-      const key = name.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const menuItem = typeof entry === "object" && isObjectId(entry?.menuItem) ? entry.menuItem : null;
-      dishes.push({ name, menuItem });
-    }
+    const { dishes, error } = await resolveDishes(body.favoriteDishes, String(restaurant ?? existing?.restaurant ?? ""));
+    if (error) return { error };
     if (dishes.length > REVIEW_LIMITS.favoriteDishes) {
       return { error: `At most ${REVIEW_LIMITS.favoriteDishes} favourite dishes` };
     }
@@ -130,26 +203,40 @@ const buildFields = async (body, { userId, existing = null, isCreate = false }) 
 
 // Content fields whose change sends a review back through moderation.
 const MODERATED_FIELDS = ["sentiment", "comment", "photos", "labels", "favoriteDishes"];
-const sameValue = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+// Dishes compare by name + menu item (stored translations are derived).
+const comparable = (key, value) =>
+  key === "favoriteDishes" && Array.isArray(value)
+    ? value.map((d) => [d.name, d.menuItem ? String(d.menuItem) : null])
+    : value;
+const sameValue = (key, a, b) =>
+  JSON.stringify(comparable(key, a) ?? null) === JSON.stringify(comparable(key, b) ?? null);
+
+// Statuses an author's edit may re-run moderation on. A rejected / flagged
+// review stays so until an admin looks at it again (editedAt shows the edit).
+const REMODERATED_STATUSES = ["pending", "approved"];
 
 /**
  * Apply validated fields to an existing review, re-moderate on content
- * change, clean up removed photos and refresh the restaurant rating.
+ * change (pending / approved reviews only), clean up removed photos and
+ * refresh the restaurant rating.
  */
 const applyUpdate = async (review, fields) => {
   const before = review.toObject();
   const changed = MODERATED_FIELDS.some(
-    (key) => fields[key] !== undefined && !sameValue(fields[key], before[key]),
+    (key) => fields[key] !== undefined && !sameValue(key, fields[key], before[key]),
   );
   Object.entries(fields).forEach(([key, value]) => {
     review[key] = value;
   });
   if (changed) {
-    const { status, note } = await ReviewService.moderationFor(review.sentiment);
-    review.status = status;
-    review.moderationNote = note;
-    review.moderatedBy = null;
-    review.moderatedAt = null;
+    review.editedAt = new Date();
+    if (REMODERATED_STATUSES.includes(review.status || "approved")) {
+      const { status, note } = await ReviewService.moderationFor(review.sentiment);
+      review.status = status;
+      review.moderationNote = note;
+      review.moderatedBy = null;
+      review.moderatedAt = null;
+    }
   }
   await review.save();
 
@@ -158,26 +245,16 @@ const applyUpdate = async (review, fields) => {
     await ReviewService.deletePhotos((before.photos || []).filter((p) => !keep.has(p)), review._id);
   }
   await ReviewService.recomputeRestaurant(review.restaurant);
+  // Newly public after the edit → followers' list-visit notice (deduped).
+  if (review.status === "approved" && before.status !== "approved" && !review.isStealth) {
+    await Notification.notifyListVisit({ actor: review.user, restaurant: review.restaurant, review: review._id });
+  }
   return review;
 };
 
-// Tagged friends learn they were tagged (not for stealth reviews).
-const notifyCompanions = (review, actor, previous = []) => {
-  if (review.isStealth) return;
-  const before = new Set(previous.map(String));
-  (review.companions || [])
-    .filter((id) => !before.has(String(id)))
-    .forEach((id) =>
-      ReviewService.notify({
-        recipient: id,
-        actor,
-        type: "review",
-        message: "tagged you in their review.",
-        review: review._id,
-        restaurant: review.restaurant,
-        data: { reason: "companion" },
-      }),
-    );
+// Tagged friends learn they were tagged — once per review, only while it is public.
+const notifyCompanions = (review) => {
+  ReviewService.notifyCompanions(review);
 };
 
 const populateReview = (query) =>
@@ -185,10 +262,15 @@ const populateReview = (query) =>
     .populate("user", `${ReviewService.AUTHOR_FIELDS}`)
     .populate({ path: "companions", select: ReviewService.USER_CARD_FIELDS, match: { isDeleted: false } });
 
+// Most of the viewer's own reviews of one place returned with a review list.
+const MY_REVIEWS_LIMIT = 50;
+
 /**
  * List a restaurant's public reviews (approved only), newest first.
  * GET /api/reviews?restaurant=:id&page=1&limit=10&sort=recent|oldest|highest|lowest|popular&sentiment=
- * → { reviews, myReview, summary, distribution, pagination }
+ * → { reviews, myReviews, myReview, summary, distribution, pagination }
+ *   myReviews — the viewer's own reviews of this place (any status), newest
+ *   first; myReview = the latest of them (null without one), kept for older clients.
  */
 const listReviews = asyncHandler(async (req, res) => {
   const { restaurant } = req.query;
@@ -201,20 +283,27 @@ const listReviews = asyncHandler(async (req, res) => {
     if (!(req.query.sentiment in SENTIMENT_SCORE)) return badRequest(res, "Invalid sentiment");
     extra.sentiment = req.query.sentiment;
   }
-  const filter = await ReviewService.publicFilter(extra);
+  // Reviews of a hidden restaurant (pending, suspended, Trash) are not public.
+  if (!(await ReviewService.isRestaurantPublic(restaurant))) return restaurantNotFound(res);
+  const hidden = await ReviewService.hiddenAuthorIds();
+  const filter = await ReviewService.publicFilter(extra, { hidden });
 
   const [reviews, total, summary, mine] = await Promise.all([
     populateReview(Review.find(filter).sort(sort).skip(params.skip).limit(params.limit)),
     Review.countDocuments(filter),
-    ReviewService.summarize(restaurant),
-    populateReview(Review.findOne({ restaurant, user: req.user._id, isDeleted: false })),
+    ReviewService.summarize(restaurant, { hidden }),
+    populateReview(
+      Review.find({ restaurant, user: req.user._id, isDeleted: false }).sort({ createdAt: -1 }).limit(MY_REVIEWS_LIMIT),
+    ),
   ]);
+  const myReviews = mine.map((r) => toPublic(r, req.user));
 
   res.json({
     success: true,
     data: {
       reviews: reviews.map((r) => toPublic(r, req.user)),
-      myReview: mine ? toPublic(mine, req.user) : null,
+      myReviews,
+      myReview: myReviews[0] || null, // kept for older clients
       summary,
       distribution: summary.distribution, // kept for older clients
       pagination: pagination(params, total),
@@ -224,32 +313,53 @@ const listReviews = asyncHandler(async (req, res) => {
 
 /**
  * Public rating summary (same aggregation as the review list header).
- * GET /api/reviews/summary?restaurant=:id → { summary: { rating, reviewCount, distribution } }
+ * GET /api/reviews/summary?restaurant=:id
+ * → { summary: { rating, reviewCount, likedPercent, distribution, reviewStats } }
  */
 const getSummary = asyncHandler(async (req, res) => {
   const { restaurant } = req.query;
   if (!isObjectId(restaurant)) return badRequest(res, "A valid restaurant id is required");
-  const exists = await Restaurant.exists({ _id: restaurant, isDeleted: false });
-  if (!exists) return notFound(res, "Restaurant not found", "RESTAURANT_NOT_FOUND");
+  if (!(await ReviewService.isRestaurantPublic(restaurant))) return restaurantNotFound(res);
   const summary = await ReviewService.summarize(restaurant);
   res.json({ success: true, data: { summary } });
 });
 
 /**
  * "Photos from members": photos of a restaurant's public reviews, newest
- * first; `dish` keeps photos of reviews that list that favourite dish.
- * GET /api/reviews/photos?restaurant=:id&dish=&page=1&limit=20
+ * first; `dish` keeps photos of reviews that list that favourite dish — a
+ * menu item id, or its name in any language (`menuItem` = id also works).
+ * GET /api/reviews/photos?restaurant=:id&dish=&menuItem=&page=1&limit=20
  * → { photos: [{ url, review, dish, user, createdAt }], pagination }
  */
 const listPhotos = asyncHandler(async (req, res) => {
   const { restaurant } = req.query;
   if (!isObjectId(restaurant)) return badRequest(res, "A valid restaurant id is required");
+  if (!(await ReviewService.isRestaurantPublic(restaurant))) return restaurantNotFound(res);
   const params = pageParams(req.query, { defaultLimit: 20 });
-  const dish = cleanName(req.query.dish);
+  const dish = cleanName(typeof req.query.dish === "string" ? req.query.dish : "");
+  const menuItemId = isObjectId(req.query.menuItem) ? String(req.query.menuItem) : isObjectId(dish) ? dish : null;
 
   const match = await ReviewService.publicFilter({ restaurant: new ObjectId(restaurant) });
   match["photos.0"] = { $exists: true };
-  if (dish) match["favoriteDishes.name"] = { $regex: `^${escapeRegex(dish)}$`, $options: "i" };
+  // Menu items the filter means (by id, or by name in en / az / ru).
+  const dishIds = new Set(menuItemId ? [menuItemId] : []);
+  const dishName = menuItemId ? "" : dish.toLowerCase();
+  if (dishName) {
+    const items = await MenuItem.find({ restaurant }, "name translations").lean();
+    items.filter((item) => dishNames(item).includes(dishName)).forEach((item) => dishIds.add(String(item._id)));
+  }
+  if (dishIds.size || dishName) {
+    const rx = dishName ? { $regex: `^${escapeRegex(dish)}$`, $options: "i" } : null;
+    match.$or = [
+      ...(dishIds.size ? [{ "favoriteDishes.menuItem": { $in: [...dishIds].map((id) => new ObjectId(id)) } }] : []),
+      ...(rx
+        ? [{ "favoriteDishes.name": rx }, { "favoriteDishes.translations.az.name": rx }, { "favoriteDishes.translations.ru.name": rx }]
+        : []),
+    ];
+  }
+  const matchesDish = (d) =>
+    (d.menuItem && dishIds.has(String(d.menuItem))) ||
+    (!!dishName && [d.name, d.translations?.az?.name, d.translations?.ru?.name].some((v) => v?.toLowerCase() === dishName));
 
   const [rows, totals] = await Promise.all([
     Review.aggregate([
@@ -264,7 +374,7 @@ const listPhotos = asyncHandler(async (req, res) => {
   ]);
   const authors = await User.find(
     { _id: { $in: rows.filter((r) => !r.isStealth).map((r) => r.user) } },
-    `${ReviewService.USER_CARD_FIELDS} settings.reviewsVisibility`,
+    `${ReviewService.USER_CARD_FIELDS} isPrivate settings.reviewsVisibility`,
   ).lean();
   const byId = new Map(authors.map((u) => [String(u._id), u]));
 
@@ -274,10 +384,11 @@ const listPhotos = asyncHandler(async (req, res) => {
       photos: rows.map((r) => {
         const author = r.isStealth ? null : byId.get(String(r.user));
         const visible = author && ReviewService.canSeeActivity(req.user, author);
+        const found = dishIds.size || dishName ? (r.favoriteDishes || []).find(matchesDish) : null;
         return {
           url: r.photos,
           review: r._id,
-          dish: dish ? r.favoriteDishes.find((d) => d.name.toLowerCase() === dish.toLowerCase())?.name || dish : null,
+          dish: found ? translated(found, "name", req.lang) : dish || null,
           user: visible ? ReviewService.publicUser(author) : null,
           createdAt: r.createdAt,
         };
@@ -288,52 +399,61 @@ const listPhotos = asyncHandler(async (req, res) => {
 });
 
 /**
- * Create the current user's review — or update it when they already have a
- * live review of this restaurant. New / changed content goes through
- * moderation (Settings.autoApproveReviews / autoFlagReviews).
+ * Write a NEW review of a restaurant — a user may review the same place
+ * several times (separate visits); edits go through PUT /api/reviews/:id.
+ * At most one new review per user per restaurant per 24 h → 429
+ * REVIEW_TOO_SOON { retryAfter: seconds } (+ Retry-After header). New content
+ * goes through moderation (Settings.autoApproveReviews / autoFlagReviews).
  * POST /api/reviews
  *   { restaurant, sentiment, comment?, photos?, companions?, labels?,
  *     favoriteDishes?, visitDate?, isStealth? }
- * → 201 { review } on create, 200 { review } on update
+ * → 201 { review }
  */
 const createReview = asyncHandler(async (req, res) => {
   const { restaurant } = req.body;
   if (!isObjectId(restaurant)) return badRequest(res, "restaurant and sentiment are required");
 
-  const place = await Restaurant.exists({ _id: restaurant, isDeleted: false });
-  if (!place) return notFound(res, "Restaurant not found", "RESTAURANT_NOT_FOUND");
+  // Only public (active) restaurants can be reviewed.
+  if (!(await ReviewService.isRestaurantPublic(restaurant))) return restaurantNotFound(res);
 
-  const existing = await Review.findOne({ restaurant, user: req.user._id, isDeleted: false });
-  const { fields, error, code } = await buildFields(req.body, {
-    userId: req.user._id,
-    existing,
-    isCreate: !existing,
-  });
+  const retryAfter = await ReviewService.newReviewCooldown({ restaurant, user: req.user._id });
+  if (retryAfter > 0) return reviewTooSoon(res, retryAfter);
+
+  const { fields, error, code } = await buildFields(req.body, { user: req.user, restaurant, isCreate: true });
   if (error) return badRequest(res, error, code);
 
-  let review;
-  if (existing) {
-    const previousCompanions = [...existing.companions];
-    review = await applyUpdate(existing, fields);
-    notifyCompanions(review, req.user._id, previousCompanions);
-  } else {
-    const { status, note } = await ReviewService.moderationFor(fields.sentiment);
-    review = await Review.create({
-      restaurant,
-      user: req.user._id,
-      ...fields,
-      status,
-      moderationNote: note,
-    });
-    await ReviewService.recomputeRestaurant(restaurant);
-    notifyCompanions(review, req.user._id);
-    if (review.status === "approved" && !review.isStealth) {
-      await Notification.notifyListVisit({ actor: req.user._id, restaurant, review: review._id });
-    }
+  // Held as pending after an earlier removed / rejected / flagged review of this place.
+  const { status, note } = await ReviewService.moderationForNew({
+    restaurant,
+    user: req.user._id,
+    sentiment: fields.sentiment,
+  });
+  let review = await Review.create({
+    restaurant,
+    user: req.user._id,
+    ...fields,
+    status,
+    moderationNote: note,
+  });
+  // Two parallel posts both passed the check above: only the first one stays.
+  const first = await Review.findOne(
+    { restaurant, user: req.user._id, createdAt: { $gt: new Date(review.createdAt.getTime() - REVIEW_COOLDOWN_MS) } },
+    "_id",
+  )
+    .sort({ createdAt: 1, _id: 1 })
+    .lean();
+  if (first && String(first._id) !== String(review._id)) {
+    await Review.deleteOne({ _id: review._id });
+    return reviewTooSoon(res, Math.ceil(REVIEW_COOLDOWN_MS / 1000));
+  }
+  await ReviewService.recomputeRestaurant(restaurant);
+  notifyCompanions(review);
+  if (review.status === "approved" && !review.isStealth) {
+    await Notification.notifyListVisit({ actor: req.user._id, restaurant, review: review._id });
   }
 
   review = await populateReview(Review.findById(review._id));
-  res.status(existing ? 200 : 201).json({
+  res.status(201).json({
     success: true,
     message: review.status === "approved" ? "Review saved" : "Review submitted for moderation",
     data: { review: toPublic(review, req.user) },
@@ -352,12 +472,11 @@ const updateReview = asyncHandler(async (req, res) => {
     return res.status(403).json({ success: false, message: "You can only edit your own review", code: "FORBIDDEN" });
   }
 
-  const { fields, error, code } = await buildFields(req.body, { userId: req.user._id, existing: review });
+  const { fields, error, code } = await buildFields(req.body, { user: req.user, existing: review });
   if (error) return badRequest(res, error, code);
 
-  const previousCompanions = [...review.companions];
   await applyUpdate(review, fields);
-  notifyCompanions(review, req.user._id, previousCompanions);
+  notifyCompanions(review);
 
   const fresh = await populateReview(Review.findById(review._id));
   res.json({
@@ -469,6 +588,8 @@ const toggleLike = asyncHandler(async (req, res) => {
       { $pull: { likes: uid }, $inc: { likeCount: -1 } },
       { returnDocument: "after", timestamps: false, projection: { likeCount: 1 } },
     );
+    // Unliked → the "liked your review" notice goes away.
+    if (result) Notification.retract({ type: "review_like", actor: uid, review: review._id }).catch(() => {});
   }
   const likeCount = result
     ? Math.max(0, result.likeCount)
@@ -519,59 +640,38 @@ const listLikes = asyncHandler(async (req, res) => {
 });
 
 const SHARE_CHANNELS = ["link", "whatsapp", "sms", "instagram", "other"];
-const MAX_SHARE_RECIPIENTS = 20;
 
 /**
- * "Send a message": share a review with Yumio users (each gets a
- * notification) and/or record an external share (Copy link, WhatsApp, ...).
- * POST /api/reviews/:id/share { recipients?: [userId], message?, channel? }
- * → { sent, shareCount }
+ * Count an external share of a review (Copy link, WhatsApp, SMS, ...). In-app
+ * sending to other Yumio users was removed: a non-empty `recipients` answers
+ * 400 SHARE_DISABLED (notifications sent earlier — type "share" — still render).
+ * POST /api/reviews/:id/share { channel } → { sent: 0, shareCount }
  */
 const shareReview = asyncHandler(async (req, res) => {
   const review = await ReviewService.findVisible(req.params.id, req.user, { populate: false });
   if (!review) return notFound(res);
 
-  const raw = Array.isArray(req.body?.recipients) ? req.body.recipients : [];
-  const ids = [...new Set(raw.map((r) => String(r?._id ?? r)))].filter((id) => id !== String(req.user._id));
-  if (ids.some((id) => !isObjectId(id))) return badRequest(res, "recipients must be user ids");
-  if (ids.length > MAX_SHARE_RECIPIENTS) {
-    return badRequest(res, `You can send to at most ${MAX_SHARE_RECIPIENTS} people at once`);
+  const recipients = req.body?.recipients;
+  if (recipients !== undefined && recipients !== null && !(Array.isArray(recipients) && !recipients.length)) {
+    return badRequest(res, "Sending reviews to other users in the app is no longer available. Share the link instead", "SHARE_DISABLED");
   }
   const channel = req.body?.channel;
-  if (channel !== undefined && !SHARE_CHANNELS.includes(channel)) {
+  if (channel === undefined) return badRequest(res, `channel is required (${SHARE_CHANNELS.join(", ")})`);
+  if (!SHARE_CHANNELS.includes(channel)) {
     return badRequest(res, `channel must be one of: ${SHARE_CHANNELS.join(", ")}`);
   }
-  if (!ids.length && !channel) return badRequest(res, "Pick at least one person or a share channel");
+  // Older apps may still send a note with an external share; it is not stored.
+  if (!isTextOrEmpty(req.body?.message)) return badRequest(res, "message must be text");
 
-  const note = String(req.body?.message ?? "").trim().slice(0, 200);
-  const recipients = ids.length
-    ? await User.find({ _id: { $in: ids }, isDeleted: false, status: "active" }, "_id").lean()
-    : [];
-  await Promise.all(
-    recipients.map((u) =>
-      ReviewService.notify({
-        recipient: u._id,
-        actor: req.user._id,
-        type: "share",
-        fallbackType: "review",
-        message: "shared a review with you.",
-        review: review._id,
-        restaurant: review.restaurant,
-        data: { kind: "review", ...(note ? { note } : {}) },
-      }),
-    ),
-  );
-
-  const increment = recipients.length + (channel ? 1 : 0);
   const updated = await Review.findOneAndUpdate(
     { _id: review._id },
-    { $inc: { shareCount: increment } },
+    { $inc: { shareCount: 1 } },
     { returnDocument: "after", timestamps: false, projection: { shareCount: 1 } },
   );
   res.json({
     success: true,
-    message: recipients.length ? "Sent" : "Shared",
-    data: { sent: recipients.length, shareCount: updated?.shareCount ?? 0 },
+    message: "Shared",
+    data: { sent: 0, shareCount: updated?.shareCount ?? 0 },
   });
 });
 
@@ -658,6 +758,8 @@ const MAX_PENDING_LABEL_REQUESTS = 10;
  * POST /api/reviews/label-requests { label, group? } → 201 { request }
  */
 const requestLabel = asyncHandler(async (req, res) => {
+  if (typeof req.body?.label !== "string") return badRequest(res, "Label idea is required");
+  if (!isTextOrEmpty(req.body?.group)) return badRequest(res, "Group must be text");
   const label = cleanName(req.body?.label);
   const group = cleanName(req.body?.group);
   if (label.length < 2) return badRequest(res, "Label idea is required");

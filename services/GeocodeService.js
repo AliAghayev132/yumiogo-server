@@ -2,6 +2,7 @@ import { config } from "#config";
 import { City, Settings } from "#models";
 import { foldText, textScore } from "#utils/search.js";
 import { distanceMeters } from "#utils/geo.js";
+import { allValues, projectTranslations } from "#utils/translations.js";
 
 /**
  * GeocodeService — place search for the Search "location" field and the
@@ -11,6 +12,10 @@ import { distanceMeters } from "#utils/geo.js";
  * and towns come from OpenStreetMap Nominatim, restricted to Azerbaijan.
  * Nominatim's usage policy is respected: an identifying User-Agent, at most one
  * request per second (queued), and results cached in memory for 24 h.
+ * The queue is bounded: a lookup that would wait more than MAX_WAIT_MS is
+ * skipped (catalog-only results, `degraded`), so a burst of anonymous queries
+ * cannot stall place search for everyone; identical in-flight queries share
+ * one upstream request.
  * NOMINATIM_URL overrides the endpoint (e.g. a self-hosted instance).
  */
 
@@ -20,8 +25,11 @@ const CACHE_TTL_MS = 24 * 3600 * 1000;
 const CACHE_MAX = 1000;
 const MIN_INTERVAL_MS = 1100;
 const TIMEOUT_MS = 6000;
+// Longest a request may queue for its upstream slot before it is skipped.
+const MAX_WAIT_MS = 3000;
 
 const cache = new Map(); // key → { value, expires }
+const inFlight = new Map(); // url → Promise (identical concurrent lookups share it)
 let nextSlot = 0; // earliest time the next upstream request may start
 
 const cached = (key) => {
@@ -50,24 +58,38 @@ const agent = async () => {
   return userAgent;
 };
 
-/** GET a Nominatim endpoint (throttled). → parsed JSON or null on failure. */
-const nominatim = async (path, params) => {
+/**
+ * GET a Nominatim endpoint (throttled, bounded queue, de-duplicated).
+ * → parsed JSON, or null on failure / when the queue is too long.
+ */
+const nominatim = (path, params) => {
   const url = `${BASE_URL}/${path}?${new URLSearchParams({ format: "jsonv2", "accept-language": "en", ...params })}`;
+  if (inFlight.has(url)) return inFlight.get(url);
+
   const now = Date.now();
   const start = Math.max(now, nextSlot);
+  // Queue full: skip the external lookup instead of making everyone wait.
+  if (start - now > MAX_WAIT_MS) return Promise.resolve(null);
   nextSlot = start + MIN_INTERVAL_MS;
-  if (start > now) await wait(start - now);
-  try {
-    const res = await fetch(url, {
-      headers: { "User-Agent": await agent(), Accept: "application/json" },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } catch (error) {
-    console.error("❌ Geocoder request failed:", error.message);
-    return null;
-  }
+
+  const request = (async () => {
+    if (start > now) await wait(start - now);
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": await agent(), Accept: "application/json" },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (error) {
+      console.error("❌ Geocoder request failed:", error.message);
+      return null;
+    } finally {
+      inFlight.delete(url);
+    }
+  })();
+  inFlight.set(url, request);
+  return request;
 };
 
 const cityOf = (address = {}) =>
@@ -126,7 +148,13 @@ const toCityPlace = (c) => ({
   latitude: c.latitude,
   longitude: c.longitude,
   source: "catalog",
+  // az / ru texts (the localize middleware applies them for the request language).
+  translations: projectTranslations(c, { name: "name", label: "label", subtitle: "country" }),
 });
+
+// Best match of a query against a city's name / label in every language.
+const cityScore = (c, query) =>
+  Math.max(0, ...[...allValues(c, "name"), ...allValues(c, "label")].map((text) => textScore(text, query)));
 
 class GeocodeService {
   /**
@@ -139,9 +167,9 @@ class GeocodeService {
     const folded = foldText(query);
     if (!folded) return { places: [], degraded: false };
 
-    const cities = await City.find({ isActive: true }, "name label country latitude longitude").lean();
+    const cities = await City.find({ isActive: true }, "name label country latitude longitude translations").lean();
     const catalog = cities
-      .map((c) => ({ c, score: textScore(c.name, query) }))
+      .map((c) => ({ c, score: cityScore(c, query) }))
       .filter((x) => x.score > 0)
       .sort((a, b) => b.score - a.score)
       .map((x) => toCityPlace(x.c));
@@ -195,13 +223,20 @@ class GeocodeService {
    * → { place, degraded }
    */
   static async reverse([lng, lat]) {
-    const cities = await City.find({ isActive: true }, "name label country latitude longitude").lean();
+    const cities = await City.find({ isActive: true }, "name label country latitude longitude translations").lean();
     let nearest = null;
     cities.forEach((c) => {
       const d = distanceMeters([lng, lat], [c.longitude, c.latitude]);
       if (!nearest || d < nearest.d) nearest = { c, d };
     });
-    const cityRow = nearest ? { _id: nearest.c._id, name: nearest.c.name, label: nearest.c.label } : null;
+    const cityRow = nearest
+      ? {
+          _id: nearest.c._id,
+          name: nearest.c.name,
+          label: nearest.c.label,
+          translations: projectTranslations(nearest.c, { name: "name", label: "label" }),
+        }
+      : null;
 
     const key = `r:${lng.toFixed(4)},${lat.toFixed(4)}`;
     let place = cached(key);
@@ -248,6 +283,9 @@ class GeocodeService {
         latitude: lat,
         longitude: lng,
         source: "catalog",
+        ...(nearest && {
+          translations: projectTranslations(nearest.c, { name: "name", label: "label", subtitle: "country", country: "country" }),
+        }),
       };
     }
     return { place: { ...place, nearestCity: cityRow }, degraded };

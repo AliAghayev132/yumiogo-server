@@ -1,11 +1,14 @@
 import { mongoose } from "#lib";
-import { Restaurant, Taxonomy, MenuItem, City } from "#models";
+import { Restaurant, Taxonomy, MenuItem, MenuCategory, City } from "#models";
 import { SORT_KEYS } from "#constants";
 import { foldText, searchTokens, textScore } from "#utils/search.js";
 import { parseNear, distanceMeters, etaMinutes, formatEta } from "#utils/geo.js";
 import { priceLabel, priceRangeOf, derivePriceLevel, priceLevelBand } from "#utils/pricing.js";
 import { openStatus, hoursWeek, getTimezone } from "#utils/openingHours.js";
 import { escapeRegex } from "#utils/escapeRegex.js";
+import { allValues } from "#utils/translations.js";
+import { OpeningHoursService } from "./OpeningHoursService.js";
+import { MenuService } from "./MenuService.js";
 
 /**
  * RestaurantQueryService — the one search engine behind the public restaurant
@@ -17,7 +20,7 @@ import { escapeRegex } from "#utils/escapeRegex.js";
  *    score, sort, pagination.
  *  - present(): adds distanceMeters, etaMinutes/etaLabel ("1h 30 min"),
  *    priceRange/priceLabel ("10 - 65₼"), derived priceLevel, live openStatus
- *    ("Open until 11:00 PM"), hasDiscount, hasMenu.
+ *    ("Open until 11:00 PM"), hasDiscount, hasMenu, reviewStats (liked %).
  *  - resolveArea(): the chosen city / location that scopes Home sections.
  */
 
@@ -28,6 +31,9 @@ const EARTH_RADIUS_M = 6378137;
 const isObjectId = (id) => OBJECT_ID.test(String(id ?? ""));
 const toObjectId = (id) => new mongoose.Types.ObjectId(String(id));
 const plain = (doc) => (doc && typeof doc.toObject === "function" ? doc.toObject() : doc);
+
+// Admin-only bookkeeping, left out of public restaurant payloads.
+const ADMIN_FIELDS = ["createdBy", "moderatedBy", "moderatedAt", "statusReason", "isDeleted"];
 
 // Query value → list of strings (comma-separated and/or repeated params).
 const listParam = (value) => {
@@ -57,16 +63,20 @@ const strParam = (value, max = 120) => {
 const boolParam = (value) => ["true", "1"].includes(strParam(value).toLowerCase());
 
 // Sort key → $sort spec (the pipeline adds `_id` for a stable order).
+// `_bestRated` / `_bestRatedMonth` are added by search() (rankStages): the
+// liked percentage once a place has Settings.ratingDisplay.minReviewsForPercent
+// public reviews (all time / last 30 days), else -1 — so "best rated" = most
+// liked among places with enough reviews, then the most reviewed.
 const SORTS = {
   distance: { distanceMeters: 1, rating: -1 },
   relevance: { _relevance: -1, rating: -1, reviewCount: -1 },
-  rating: { rating: -1, reviewCount: -1 },
+  rating: { _bestRated: -1, reviewCount: -1, rating: -1 },
   popularity: { "stats.popularity7d": -1, viewCount: -1, rating: -1 },
   saved: { saveCount: -1, rating: -1 },
   newest: { publishedAt: -1, createdAt: -1 },
   price_asc: { avgPrice: 1, rating: -1 },
   price_desc: { avgPrice: -1, rating: -1 },
-  top_rated_month: { "stats.rating30d": -1, "stats.reviews30d": -1, rating: -1 },
+  top_rated_month: { _bestRatedMonth: -1, "stats.reviews30d": -1, "stats.rating30d": -1, rating: -1 },
   trending_month: { "stats.trending30d": -1, "stats.popularity7d": -1, rating: -1 },
   most_saved_month: { "stats.saves30d": -1, saveCount: -1, rating: -1 },
   on_the_rise: { "stats.rise": -1, "stats.trending30d": -1, rating: -1 },
@@ -74,8 +84,55 @@ const SORTS = {
   _rank: { _rank: 1 },
 };
 
-// Weight of a query token matching each field in the relevance score.
-const WEIGHTS = { nameStart: 60, nameWord: 40, name: 25, cuisine: 20, dish: 15, tag: 10, address: 8 };
+// Weight of a query token matching each field in the relevance score
+// (name ≫ catalog ≫ menu ≫ address / description).
+const WEIGHTS = {
+  nameStart: 60,
+  nameWord: 40,
+  name: 25,
+  cuisine: 20,
+  dish: 15,
+  menuSection: 12,
+  tag: 10,
+  address: 8,
+  description: 6,
+  dishDescription: 4,
+};
+
+// Catalog types the text search matches, by Restaurant field.
+const TEXT_TAXONOMY = {
+  cuisines: "cuisine",
+  tags: "tag",
+  features: "feature",
+  moods: "mood",
+  dietary: "dietary",
+  dining: "dining",
+};
+
+/** "Best rated" threshold: Settings.ratingDisplay.minReviewsForPercent (default 10). */
+const minReviewsForPercent = (settings) => {
+  const n = Number(plain(settings)?.ratingDisplay?.minReviewsForPercent);
+  return Number.isInteger(n) && n >= 1 ? n : 10;
+};
+
+// Liked percentage once `countPath` reaches `min`, else -1 (ranked after).
+const likedRank = (countPath, percentPath, min) => ({
+  $cond: [{ $gte: [{ $ifNull: [countPath, 0] }, min] }, { $ifNull: [percentPath, 0] }, -1],
+});
+
+/** $addFields for the sort keys that rank by liked percentage (else null). */
+const rankStages = (sortKey, settings) => {
+  const min = minReviewsForPercent(settings);
+  if (sortKey === "rating") {
+    return { $addFields: { _bestRated: likedRank("$reviewStats.total", "$reviewStats.likedPercent", min) } };
+  }
+  if (sortKey === "top_rated_month") {
+    return { $addFields: { _bestRatedMonth: likedRank("$stats.reviews30d", "$stats.likedPercent30d", min) } };
+  }
+  return null;
+};
+
+const EMPTY_REVIEW_STATS = { total: 0, liked: 0, fine: 0, disliked: 0, likedPercent: 0 };
 
 /** Active admin sort options, ordered (Settings.sortOptions). */
 const activeSortOptions = (settings) =>
@@ -95,39 +152,42 @@ class RestaurantQueryService {
   static strParam = strParam;
   static boolParam = boolParam;
   static defaultSortKey = defaultSortKey;
+  static minReviewsForPercent = minReviewsForPercent;
+  static SORTS = SORTS;
 
   // ------------------------------------------------------------------ text
 
   /**
-   * Catalog names (cuisine / tag / mood / dietary / dining) whose folded name
-   * contains `token`, grouped by restaurant field.
+   * Catalog names (cuisine / tag / feature / mood / dietary / dining) whose
+   * folded name in any language contains `token`, grouped by restaurant field.
    */
   static async taxonomyMatches(tokens) {
     if (!tokens.length) return [];
     const items = await Taxonomy.find(
-      { type: { $in: ["cuisine", "tag", "mood", "dietary", "dining"] }, isActive: true },
-      "type name",
+      { type: { $in: Object.values(TEXT_TAXONOMY) }, isActive: true },
+      "type name translations",
     ).lean();
-    const folded = items.map((i) => ({ ...i, key: foldText(i.name) }));
+    // Every language of the name ("Turkish", "Türk", "Турецкая").
+    const folded = items.map((i) => ({ ...i, key: foldText(allValues(i, "name").join(" ")) }));
     return tokens.map((token) => {
       const hit = folded.filter((i) => i.key.includes(token));
-      const names = (type) => hit.filter((i) => i.type === type).map((i) => i.name);
-      return {
-        cuisines: names("cuisine"),
-        tags: names("tag"),
-        moods: names("mood"),
-        dietary: names("dietary"),
-        dining: names("dining"),
-      };
+      return Object.fromEntries(
+        Object.entries(TEXT_TAXONOMY).map(([field, type]) => [
+          field,
+          hit.filter((i) => i.type === type).map((i) => i.name),
+        ]),
+      );
     });
   }
 
-  /** Restaurant ids with an available menu item whose name contains `token`. */
+  /** Restaurant ids with a visible menu item whose name contains `token`. */
   static async dishMatches(tokens) {
+    if (!tokens.length) return [];
+    const visible = await MenuService.visibleItemFilter();
     return Promise.all(
       tokens.map((token) =>
         MenuItem.distinct("restaurant", {
-          isAvailable: true,
+          ...visible,
           searchKey: { $regex: escapeRegex(token) },
         }),
       ),
@@ -135,36 +195,70 @@ class RestaurantQueryService {
   }
 
   /**
-   * Text-search clause + relevance expression for `q`. Every token must match
-   * the name, address, a cuisine / tag / mood / dietary / dining name or a
-   * dish; the score weighs where it matched.
+   * Menu hits per token, one aggregation per collection: restaurants with a
+   * visible menu item whose name (`dish`) or only its description
+   * (`dishText`) contains the token, or an active menu section whose name
+   * does (`section`) — folded keys in every language.
+   * → [{ dish: [ObjectId], dishText: [ObjectId], section: [ObjectId] }] per token
+   */
+  static async menuMatches(tokens) {
+    if (!tokens.length) return [];
+    const escaped = tokens.map(escapeRegex);
+    const any = escaped.join("|");
+    const flags = (prefix, field) =>
+      Object.fromEntries(
+        escaped.map((esc, i) => [`${prefix}${i}`, { $max: { $regexMatch: { input: `$${field}`, regex: esc } } }]),
+      );
+    const visible = await MenuService.visibleItemFilter();
+    const [items, sections] = await Promise.all([
+      MenuItem.aggregate([
+        { $match: { ...visible, searchText: { $regex: any } } },
+        { $group: { _id: "$restaurant", ...flags("n", "searchKey"), ...flags("t", "searchText") } },
+      ]),
+      MenuCategory.aggregate([
+        { $match: { isActive: true, searchKey: { $regex: any } } },
+        { $group: { _id: "$restaurant", ...flags("c", "searchKey") } },
+      ]),
+    ]);
+    return tokens.map((_token, i) => ({
+      dish: items.filter((row) => row[`n${i}`]).map((row) => row._id),
+      dishText: items.filter((row) => row[`t${i}`] && !row[`n${i}`]).map((row) => row._id),
+      section: sections.filter((row) => row[`c${i}`]).map((row) => row._id),
+    }));
+  }
+
+  /**
+   * Text-search clause + relevance expression for `q` — full text over the
+   * restaurant's content in en / az / ru. Every token must match the name,
+   * address + city, description, a cuisine / tag / feature / mood / dietary /
+   * dining name, a dish name or description, or a menu section name; the
+   * score weighs where it matched (WEIGHTS).
    * → { match, score } (both null for an empty query)
    */
   static async textQuery(q) {
     const tokens = searchTokens(q);
     if (!tokens.length) return { match: null, score: null, tokens };
 
-    const [taxonomy, dishes] = await Promise.all([
-      this.taxonomyMatches(tokens),
-      this.dishMatches(tokens),
-    ]);
+    const [taxonomy, menu] = await Promise.all([this.taxonomyMatches(tokens), this.menuMatches(tokens)]);
 
     const and = [];
     const scoreParts = [];
+    const TAG_FIELDS = ["tags", "features", "moods", "dietary", "dining"];
     tokens.forEach((token, i) => {
       const esc = escapeRegex(token);
       const t = taxonomy[i];
-      const tagNames = [...t.tags, ...t.moods, ...t.dietary, ...t.dining];
+      const m = menu[i];
+      const tagNames = TAG_FIELDS.flatMap((field) => t[field]);
       const or = [
         { "search.name": { $regex: esc } },
         { "search.address": { $regex: esc } },
-        { _id: { $in: dishes[i] } },
+        { "search.text": { $regex: esc } },
       ];
-      if (t.cuisines.length) or.push({ cuisines: { $in: t.cuisines } });
-      if (t.tags.length) or.push({ tags: { $in: t.tags } });
-      if (t.moods.length) or.push({ moods: { $in: t.moods } });
-      if (t.dietary.length) or.push({ dietary: { $in: t.dietary } });
-      if (t.dining.length) or.push({ dining: { $in: t.dining } });
+      const menuIds = [...m.dish, ...m.dishText, ...m.section];
+      if (menuIds.length) or.push({ _id: { $in: menuIds } });
+      Object.keys(TEXT_TAXONOMY).forEach((field) => {
+        if (t[field].length) or.push({ [field]: { $in: t[field] } });
+      });
       and.push({ $or: or });
 
       const hasAny = (field, names) => ({
@@ -182,12 +276,12 @@ class RestaurantQueryService {
           },
         },
         { $multiply: [WEIGHTS.cuisine, hasAny("cuisines", t.cuisines)] },
-        { $multiply: [WEIGHTS.tag, hasAny("tags", tagNames)] },
-        { $multiply: [WEIGHTS.tag, hasAny("moods", tagNames)] },
-        { $multiply: [WEIGHTS.tag, hasAny("dietary", tagNames)] },
-        { $multiply: [WEIGHTS.tag, hasAny("dining", tagNames)] },
-        { $cond: [{ $in: ["$_id", dishes[i]] }, WEIGHTS.dish, 0] },
-        { $cond: [{ $regexMatch: { input: "$search.address", regex: esc } }, WEIGHTS.address, 0] },
+        ...TAG_FIELDS.map((field) => ({ $multiply: [WEIGHTS.tag, hasAny(field, tagNames)] })),
+        { $cond: [{ $in: ["$_id", m.dish] }, WEIGHTS.dish, 0] },
+        { $cond: [{ $in: ["$_id", m.section] }, WEIGHTS.menuSection, 0] },
+        { $cond: [{ $in: ["$_id", m.dishText] }, WEIGHTS.dishDescription, 0] },
+        { $cond: [{ $regexMatch: { input: { $ifNull: ["$search.address", ""] }, regex: esc } }, WEIGHTS.address, 0] },
+        { $cond: [{ $regexMatch: { input: { $ifNull: ["$search.text", ""] }, regex: esc } }, WEIGHTS.description, 0] },
       );
     });
 
@@ -201,10 +295,51 @@ class RestaurantQueryService {
   // --------------------------------------------------------------- filters
 
   /**
+   * Filter values → the English names restaurants store. A client may send a
+   * catalog name in az / ru (the catalog is localized); unknown values pass
+   * through unchanged. `byField`: { cuisines: [...], tags: [...], … }.
+   */
+  static async canonicalTaxonomy(byField) {
+    const types = { cuisines: "cuisine", moods: "mood", features: "feature", tags: "tag", dietary: "dietary", dining: "dining" };
+    const wanted = Object.entries(byField).filter(([, values]) => values.length);
+    if (!wanted.length) return byField;
+    const items = await Taxonomy.find(
+      { type: { $in: wanted.map(([field]) => types[field]) } },
+      "type name translations",
+    ).lean();
+    const lookup = new Map();
+    items.forEach((item) =>
+      allValues(item, "name").forEach((value) => {
+        const key = `${item.type}:${foldText(value)}`;
+        if (!lookup.has(key)) lookup.set(key, item.name);
+      }),
+    );
+    const out = { ...byField };
+    wanted.forEach(([field, values]) => {
+      out[field] = [...new Set(values.map((v) => lookup.get(`${types[field]}:${foldText(v)}`) || v))];
+    });
+    return out;
+  }
+
+  /** City filter value (id, or name / label in any language) → Restaurant.city. */
+  static async canonicalCity(value) {
+    const wanted = foldText(value);
+    if (!wanted) return value;
+    if (isObjectId(value)) {
+      const byId = await City.findById(value, "name").lean();
+      if (byId) return byId.name;
+    }
+    const cities = await City.find({}, "name label translations").lean();
+    const hit = cities.find((c) => [...allValues(c, "name"), ...allValues(c, "label")].some((v) => foldText(v) === wanted));
+    return hit ? hit.name : value;
+  }
+
+  /**
    * Query params → { match, expr, textScore, ... }.
-   * Supported: q/search (name, cuisines, tags, moods, dietary, dining, dishes,
-   * address — Azerbaijani letters folded), cuisine/cuisines (any of),
-   * features/tags/dietary/dining + mood/moods (all of), dish, city, priceLevel,
+   * Supported: q/search (full text: name, description, address + city,
+   * cuisines, tags, features, moods, dietary, dining, dish names / descriptions,
+   * menu sections — en / az / ru, Azerbaijani letters folded), cuisine/cuisines (any of),
+   * features/tags/dietary/dining + mood/moods (all of), dish, city (id or name), priceLevel,
    * openNow, discount, hasMenu, minRating, minReviews, minPrice/maxPrice (₼, overlapping
    * the restaurant's price range), ids (comma list), exclude.
    */
@@ -212,16 +347,21 @@ class RestaurantQueryService {
     const match = { ...ACTIVE };
     const and = [];
 
-    const cuisines = [...listParam(query.cuisine), ...listParam(query.cuisines)];
-    if (cuisines.length) match.cuisines = { $in: cuisines };
-    const moods = [...listParam(query.mood), ...listParam(query.moods)];
-    if (moods.length) match.moods = { $all: moods };
+    const terms = await this.canonicalTaxonomy({
+      cuisines: [...listParam(query.cuisine), ...listParam(query.cuisines)],
+      moods: [...listParam(query.mood), ...listParam(query.moods)],
+      features: listParam(query.features),
+      tags: listParam(query.tags),
+      dietary: listParam(query.dietary),
+      dining: listParam(query.dining),
+    });
+    if (terms.cuisines.length) match.cuisines = { $in: terms.cuisines };
+    if (terms.moods.length) match.moods = { $all: terms.moods };
     ["features", "tags", "dietary", "dining"].forEach((field) => {
-      const values = listParam(query[field]);
-      if (values.length) match[field] = { $all: values };
+      if (terms[field].length) match[field] = { $all: terms[field] };
     });
 
-    const city = strParam(query.city, 80);
+    const city = await this.canonicalCity(strParam(query.city, 80));
     if (city) match.city = { $regex: `^${escapeRegex(city)}$`, $options: "i" };
 
     const priceLevel = strParam(query.priceLevel, 4);
@@ -236,14 +376,15 @@ class RestaurantQueryService {
         match.priceLevel = priceLevel;
       }
     }
-    if (boolParam(query.openNow)) match.openNow = true;
+    if (boolParam(query.openNow)) {
+      // The stored flag is refreshed on a timer; make sure it is recent.
+      await OpeningHoursService.ensureFresh();
+      match.openNow = true;
+    }
     if (boolParam(query.discount)) match.discountPercent = { $gt: 0 };
     // "Menu" chip / "Has a menu": dishes or menu photos exist.
     if (boolParam(query.hasMenu)) {
-      match.$and = [
-        ...(match.$and || []),
-        { $or: [{ menuItemCount: { $gt: 0 } }, { "menuPhotos.0": { $exists: true } }] },
-      ];
+      and.push({ $or: [{ menuItemCount: { $gt: 0 } }, { "menuPhotos.0": { $exists: true } }] });
     }
 
     const minRating = numParam(query.minRating);
@@ -294,11 +435,12 @@ class RestaurantQueryService {
    * Run a restaurant search.
    * options: { settings, near, radius (m, null = unlimited), sort, page, limit,
    *            restrictIds (only these ObjectIds), rankIds (ordered ObjectIds for
-   *            the internal "_rank" sort) }
+   *            the internal "_rank" sort), lang (status labels) }
    * → { restaurants (presented), total, page, limit, pages, sort }
    */
   static async search(query, options = {}) {
-    const { settings, near = null, radius = null, page = 1, limit = 20, rankIds = null, restrictIds = null } = options;
+    const { settings, near = null, radius = null, page = 1, limit = 20, rankIds = null, restrictIds = null, lang = "en" } =
+      options;
     const { match, expr, textScore: scoreExpr } = await this.buildFilter(query, { settings, restrictIds });
 
     let sortKey = options.sort && (SORTS[options.sort] ? options.sort : null);
@@ -342,6 +484,8 @@ class RestaurantQueryService {
     if (sortKey === "_rank" && rankIds) {
       pipeline.push({ $addFields: { _rank: { $indexOfArray: [rankIds, "$_id"] } } });
     }
+    const rank = rankStages(sortKey, settings);
+    if (rank) pipeline.push(rank);
 
     const skip = (page - 1) * limit;
     pipeline.push(
@@ -356,7 +500,7 @@ class RestaurantQueryService {
 
     const [result] = await Restaurant.aggregate(pipeline);
     const total = result?.total?.[0]?.n || 0;
-    const ctx = this.context(settings, near);
+    const ctx = this.context(settings, near, lang);
     return {
       restaurants: (result?.items || []).map((r) => this.present(r, ctx)),
       total,
@@ -369,11 +513,12 @@ class RestaurantQueryService {
 
   // --------------------------------------------------------------- present
 
-  /** Shared decoration context (settings bits, location, clock). */
-  static context(settings, near = null) {
+  /** Shared decoration context (settings bits, location, clock, label language). */
+  static context(settings, near = null, lang = "en") {
     const s = plain(settings) || {};
     return {
       near,
+      lang: lang || "en",
       eta: s.eta || {},
       priceLevels: s.priceLevels || [],
       timezone: s.timezone || getTimezone(),
@@ -383,15 +528,20 @@ class RestaurantQueryService {
 
   /**
    * Public restaurant payload: the stored fields plus the derived display
-   * values. `detail` adds the week for the Hours sheet.
+   * values. `detail` adds the week for the Hours sheet; `admin` keeps the
+   * moderation / bookkeeping fields (createdBy, moderatedBy, statusReason, …)
+   * that public responses leave out.
    */
-  static present(doc, ctx, { detail = false } = {}) {
+  static present(doc, ctx, { detail = false, admin = false } = {}) {
     if (!doc) return doc;
     const r = typeof doc.toJSON === "function" ? doc.toJSON() : { ...doc };
     delete r.search;
     delete r.menuImportedAt;
     delete r._relevance;
     delete r._rank;
+    delete r._bestRated;
+    delete r._bestRatedMonth;
+    if (!admin) ADMIN_FIELDS.forEach((field) => delete r[field]);
     if (r.id === undefined && r._id) r.id = String(r._id);
 
     const coords = r.location?.coordinates;
@@ -409,16 +559,18 @@ class RestaurantQueryService {
     const level = derivePriceLevel(r.avgPrice, ctx.priceLevels);
     if (level) r.priceLevel = level;
 
-    const status = openStatus(r, ctx.now, ctx.timezone);
+    const status = openStatus(r, ctx.now, ctx.timezone, ctx.lang);
     r.openNow = status.isOpen;
     r.openStatus = status;
     r.openUntil = status.openUntil;
     r.opensAt = status.opensAt;
-    if (detail) r.hoursWeek = hoursWeek(r.hours, ctx.now, ctx.timezone);
+    if (detail) r.hoursWeek = hoursWeek(r.hours, ctx.now, ctx.timezone, ctx.lang);
 
     r.hasDiscount = (r.discountPercent || 0) > 0;
     r.menuPhotos = r.menuPhotos || [];
     r.hasMenu = (r.menuItemCount || 0) > 0 || r.menuPhotos.length > 0;
+    // Liked-percentage rating (zeros until the boot backfill reached an old doc).
+    r.reviewStats = { ...EMPTY_REVIEW_STATS, ...(r.reviewStats || {}) };
     return r;
   }
 
@@ -432,12 +584,25 @@ class RestaurantQueryService {
    */
   static async resolveArea({ near = null, city = "" } = {}, settings) {
     const maxRadius = plain(settings)?.filters?.maxRadius || 50000;
-    const cities = await City.find({ isActive: true }, "name label country latitude longitude").lean();
-    const shape = (c) => (c ? { _id: c._id, name: c.name, label: c.label || `${c.name}, ${c.country || ""}` } : null);
+    const cities = await City.find({ isActive: true }, "name label country latitude longitude translations").lean();
+    const shape = (c) =>
+      c
+        ? {
+            _id: c._id,
+            name: c.name,
+            label: c.label || `${c.name}, ${c.country || ""}`,
+            key: c.name,
+            translations: c.translations || {},
+          }
+        : null;
 
     const wanted = foldText(city);
     let picked = wanted
-      ? cities.find((c) => String(c._id) === String(city) || foldText(c.name) === wanted)
+      ? cities.find(
+          (c) =>
+            String(c._id) === String(city) ||
+            [...allValues(c, "name"), ...allValues(c, "label")].some((v) => foldText(v) === wanted),
+        )
       : null;
 
     if (picked) {
@@ -486,6 +651,15 @@ class RestaurantQueryService {
     const { defaultRadius = 20000, maxRadius = 50000 } = plain(settings)?.filters || {};
     const n = parseInt(strParam(query.radius), 10);
     return Math.min(Number.isFinite(n) && n > 0 ? n : defaultRadius, maxRadius);
+  }
+
+  /**
+   * Aggregation stages ordering restaurants like the "best rated" sort
+   * (liked % among places with enough reviews, then reviewCount) — for
+   * callers outside search() (the Best rated tile cover).
+   */
+  static bestRatedStages(settings) {
+    return [rankStages("rating", settings), { $sort: { ...SORTS.rating, _id: 1 } }];
   }
 
   /** Is `key` a sort the API understands? */

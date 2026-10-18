@@ -6,7 +6,9 @@ import { Restaurant, RestaurantFollow, Notification, User } from "#models";
  *
  *  - follow / unfollow are idempotent; Restaurant.followerCount is kept in
  *    step atomically (never below 0).
- *  - followedIds(user) powers the chip state on any restaurant list.
+ *  - followedIds(user) powers the chip state on any restaurant list;
+ *    followedIds / followedPage only see public restaurants (filtered in the
+ *    query, so totals and pages are right).
  *  - notifyFollowers(restaurant, kind) tells followers about a new discount
  *    ("restaurant_offer") or new dishes on the menu ("restaurant_menu");
  *    Notification.notify de-duplicates per restaurant per week, so an admin
@@ -55,18 +57,36 @@ export class RestaurantFollowService {
     return !!(await RestaurantFollow.exists({ user: userId, restaurant: restaurantId }));
   }
 
-  /** Ids of the restaurants `userId` follows (strings, newest first). */
+  /**
+   * Filter on `userId`'s follows of public restaurants only (active, not in
+   * Trash) — the others stay followed but are not shown or counted.
+   */
+  static async liveFilter(userId) {
+    const followed = await RestaurantFollow.distinct("restaurant", { user: userId });
+    const live = followed.length
+      ? await Restaurant.distinct("_id", { _id: { $in: followed }, isDeleted: false, status: "active" })
+      : [];
+    return { user: userId, restaurant: { $in: live } };
+  }
+
+  /** Ids of the public restaurants `userId` follows (strings, newest first). */
   static async followedIds(userId) {
     if (!userId) return [];
-    const rows = await RestaurantFollow.find({ user: userId }, "restaurant").sort({ createdAt: -1 }).lean();
+    const filter = await this.liveFilter(userId);
+    const rows = await RestaurantFollow.find(filter, "restaurant").sort({ createdAt: -1 }).lean();
     return rows.map((r) => String(r.restaurant));
   }
 
-  /** Page of followed restaurant ids → { ids, total } (live restaurants are resolved by the caller). */
+  /** Page of followed public restaurants → { rows: [{ restaurant, createdAt }], total }. */
   static async followedPage(userId, { skip = 0, limit = 20 } = {}) {
+    const filter = await this.liveFilter(userId);
     const [rows, total] = await Promise.all([
-      RestaurantFollow.find({ user: userId }, "restaurant createdAt").sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-      RestaurantFollow.countDocuments({ user: userId }),
+      RestaurantFollow.find(filter, "restaurant createdAt")
+        .sort({ createdAt: -1, _id: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      RestaurantFollow.countDocuments(filter),
     ]);
     return { rows, total };
   }

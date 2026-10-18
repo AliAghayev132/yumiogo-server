@@ -1,4 +1,6 @@
 import { Restaurant, MenuCategory, MenuItem } from "#models";
+import { menuItemSearchKeys } from "#models/menuItem.model.js";
+import { menuCategorySearchKey } from "#models/menuCategory.model.js";
 import { foldText } from "#utils/search.js";
 import { FileService } from "./FileService.js";
 
@@ -7,14 +9,20 @@ import { FileService } from "./FileService.js";
  *
  *  - menuOf(): the grouped menu for the public "Explore full menu" screen and
  *    the admin editor.
+ *  - visibleItemFilter(): the public item clause (available, category not
+ *    hidden) shared by the menu, dish search, suggestions and Home rows.
  *  - syncRestaurant(): refreshes the derived Restaurant.popularDishes (popular,
- *    available items) and menuItemCount after every menu change.
+ *    visible items) and menuItemCount after every menu / category change.
  *  - importLegacyPopularDishes(): one-off boot migration of the old embedded
  *    popularDishes into MenuItems (idempotent via Restaurant.menuImportedAt).
  *  - applyLegacyPopularDishes(): keeps the old admin form (PUT
  *    /restaurants/:id with popularDishes) working by mapping it onto items.
  *  - deleteImageIfUnused(): removes an uploaded file nobody references.
+ *  - refreshSearchKeys(): boot backfill of the folded item / section search
+ *    keys (full-text restaurant search).
  */
+
+const KEY_BATCH = 500;
 
 // Uploaded menu photos / dish images — same folder as the "menus" upload kind
 // of POST /api/uploads/:kind.
@@ -23,6 +31,9 @@ const MENU_UPLOAD_DIR = "uploads/menus";
 const PROTECTED_DIR = "uploads/catalog/defaults/";
 
 const BY_ORDER = { order: 1, createdAt: 1 };
+
+// The trailing group of items without a category.
+const OTHER_GROUP = { name: "Other", translations: { az: { name: "Digər" }, ru: { name: "Другое" } } };
 
 // Public item shape.
 const toItem = (item) => ({
@@ -36,11 +47,30 @@ const toItem = (item) => ({
   isPopular: !!item.isPopular,
   isAvailable: item.isAvailable !== false,
   order: item.order ?? 0,
+  translations: item.translations || {},
 });
+
+// Only the az / ru `name` of an item (popularDishes mirror the name, nothing else).
+const nameTranslations = (translations) =>
+  Object.fromEntries(Object.entries(translations || {}).map(([lang, entry]) => [lang, { name: entry?.name || "" }]));
 
 class MenuService {
   static MENU_UPLOAD_DIR = MENU_UPLOAD_DIR;
   static toItem = toItem;
+
+  /**
+   * Mongo filter for the menu items the public sees: available and not in a
+   * hidden (inactive) category — items without a category stay visible.
+   * `extra` narrows it (restaurant, isPopular, …).
+   */
+  static async visibleItemFilter(extra = {}) {
+    const scope = { isActive: false };
+    if (extra.restaurant) scope.restaurant = extra.restaurant;
+    const hidden = await MenuCategory.distinct("_id", scope);
+    const filter = { ...extra, isAvailable: true };
+    if (hidden.length) filter.category = { $nin: hidden };
+    return filter;
+  }
 
   /**
    * Grouped menu of a restaurant.
@@ -48,7 +78,7 @@ class MenuService {
    * → { categories: [{ _id, name, description, order, isActive, itemCount, items }],
    *     popular: [items], itemCount }
    * Items without a category are returned in a trailing { _id: null, name: "Other" }
-   * group when there are any.
+   * group (with az / ru names) when there are any.
    */
   static async menuOf(restaurantId, { includeHidden = false } = {}) {
     const categoryFilter = { restaurant: restaurantId };
@@ -86,18 +116,20 @@ class MenuService {
         isActive: c.isActive !== false,
         itemCount: list.length,
         items: list,
+        translations: c.translations || {},
       };
     });
     const visibleGroups = includeHidden ? groups : groups.filter((g) => g.items.length);
     if (loose.length) {
       visibleGroups.push({
         _id: null,
-        name: "Other",
+        name: OTHER_GROUP.name,
         description: "",
         order: groups.length,
         isActive: true,
         itemCount: loose.length,
         items: loose,
+        translations: OTHER_GROUP.translations,
       });
     }
 
@@ -109,14 +141,18 @@ class MenuService {
     };
   }
 
-  /** Recompute Restaurant.popularDishes + menuItemCount from the menu items. */
+  /**
+   * Recompute Restaurant.popularDishes + menuItemCount from the menu items the
+   * public sees (items of hidden categories are left out).
+   */
   static async syncRestaurant(restaurantId) {
+    const visible = await this.visibleItemFilter({ restaurant: restaurantId });
     const [popular, count] = await Promise.all([
-      MenuItem.find({ restaurant: restaurantId, isPopular: true, isAvailable: true })
+      MenuItem.find({ ...visible, isPopular: true })
         .sort(BY_ORDER)
         .limit(30)
         .lean(),
-      MenuItem.countDocuments({ restaurant: restaurantId, isAvailable: true }),
+      MenuItem.countDocuments(visible),
     ]);
     await Restaurant.updateOne(
       { _id: restaurantId },
@@ -127,12 +163,51 @@ class MenuService {
             price: i.price ?? 0,
             image: i.image ?? null,
             item: i._id,
+            translations: nameTranslations(i.translations),
           })),
           menuItemCount: count,
         },
       },
       { timestamps: false },
     );
+  }
+
+  /**
+   * Re-derive MenuItem.searchKey / searchText and MenuCategory.searchKey
+   * (bulk, no hooks / timestamps): only documents missing a key, or — `all`,
+   * after a change of the key format — every document. Only changed keys are
+   * written. → { items, categories } updated
+   */
+  static async refreshSearchKeys({ all = false } = {}) {
+    const run = async (Model, filter, fields, keysOf) => {
+      let updated = 0;
+      let ops = [];
+      const flush = async () => {
+        if (ops.length) updated += (await Model.bulkWrite(ops, { ordered: false })).modifiedCount;
+        ops = [];
+      };
+      for await (const doc of Model.find(filter, fields).lean().cursor()) {
+        const keys = keysOf(doc);
+        if (Object.entries(keys).every(([key, value]) => doc[key] === value)) continue;
+        ops.push({ updateOne: { filter: { _id: doc._id }, update: { $set: keys }, timestamps: false } });
+        if (ops.length >= KEY_BATCH) await flush();
+      }
+      await flush();
+      return updated;
+    };
+    const items = await run(
+      MenuItem,
+      all ? {} : { $or: [{ searchText: { $exists: false } }, { searchKey: { $exists: false } }] },
+      "name description translations searchKey searchText",
+      menuItemSearchKeys,
+    );
+    const categories = await run(
+      MenuCategory,
+      all ? {} : { searchKey: { $exists: false } },
+      "name translations searchKey",
+      (doc) => ({ searchKey: menuCategorySearchKey(doc) }),
+    );
+    return { items, categories };
   }
 
   /** Next `order` at the end of a restaurant's categories / a category's items. */
@@ -153,8 +228,8 @@ class MenuService {
     ).lean();
     let created = 0;
     for (const restaurant of pending) {
-      const existing = await MenuItem.find({ restaurant: restaurant._id }, "searchKey").lean();
-      const have = new Set(existing.map((i) => i.searchKey));
+      const existing = await MenuItem.find({ restaurant: restaurant._id }, "name").lean();
+      const have = new Set(existing.map((i) => foldText(i.name)));
       let order = existing.length;
       const docs = [];
       (restaurant.popularDishes || []).forEach((dish) => {
@@ -169,7 +244,7 @@ class MenuService {
           isPopular: true,
           isAvailable: true,
           order: order++,
-          searchKey: key,
+          searchKey: key, // also derived by the insertMany hook; no translations yet
         });
       });
       if (docs.length) created += (await MenuItem.insertMany(docs)).length;
@@ -210,7 +285,7 @@ class MenuService {
    */
   static async applyLegacyPopularDishes(restaurantId, dishes) {
     const items = await MenuItem.find({ restaurant: restaurantId });
-    const byKey = new Map(items.map((i) => [i.searchKey || foldText(i.name), i]));
+    const byKey = new Map(items.map((i) => [foldText(i.name), i]));
     const listed = new Set();
     let order = await this.nextOrder(MenuItem, { restaurant: restaurantId });
 
@@ -233,7 +308,7 @@ class MenuService {
         });
       }
     }
-    const unlisted = items.filter((i) => i.isPopular && !listed.has(i.searchKey || foldText(i.name)));
+    const unlisted = items.filter((i) => i.isPopular && !listed.has(foldText(i.name)));
     if (unlisted.length) {
       await MenuItem.updateMany({ _id: { $in: unlisted.map((i) => i._id) } }, { $set: { isPopular: false } });
     }

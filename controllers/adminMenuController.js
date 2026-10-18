@@ -6,13 +6,14 @@ import { CatalogService, MenuService, FileService, RestaurantFollowService } fro
 
 // Utils
 import { asyncHandler } from "#utils";
+import { cleanTranslations, mergeTranslations } from "#utils/translations.js";
 
 /**
  * Admin CRUD for restaurant menus: categories, items (price in ₼, photo,
  * dietary names, popular / available flags), drag-and-drop order and the
  * "Menu photos" gallery. Mounted under /api/admin (authenticated admin only).
- * Every item change refreshes the restaurant's derived popularDishes /
- * menuItemCount (MenuService.syncRestaurant).
+ * Every item / category change refreshes the restaurant's derived
+ * popularDishes / menuItemCount (MenuService.syncRestaurant).
  */
 
 const OBJECT_ID = /^[0-9a-fA-F]{24}$/;
@@ -54,15 +55,25 @@ const saveUploads = async (req) => {
   return { urls };
 };
 
-/** order = index for `ids` (all must match `filter`). → { error } | { updated } */
-const reorder = async (Model, ids, filter) => {
+/** `ids` is a non-empty list of unique ids that all match `filter`. → { error } | {} */
+const checkIds = async (Model, ids, filter) => {
   if (!Array.isArray(ids) || !ids.length) return { error: "ids must be a non-empty array" };
   if (!ids.every(isObjectId)) return { error: "ids must be valid ids" };
   if (new Set(ids.map(String)).size !== ids.length) return { error: "ids must be unique" };
   const found = await Model.countDocuments({ ...filter, _id: { $in: ids } });
   if (found !== ids.length) return { error: "Some ids do not belong to this restaurant" };
+  return {};
+};
+
+/**
+ * order = index for `ids` (all must match `filter`); `set` adds fields to every
+ * update (e.g. a new category). Validates before writing. → { error } | { updated }
+ */
+const reorder = async (Model, ids, filter, set = {}) => {
+  const { error } = await checkIds(Model, ids, filter);
+  if (error) return { error };
   const res = await Model.bulkWrite(
-    ids.map((id, order) => ({ updateOne: { filter: { ...filter, _id: id }, update: { $set: { order } } } })),
+    ids.map((id, order) => ({ updateOne: { filter: { ...filter, _id: id }, update: { $set: { ...set, order } } } })),
   );
   return { updated: res.modifiedCount };
 };
@@ -113,7 +124,17 @@ const categoryFields = (body, { create = false } = {}) => {
     if (order === null) return { error: "Order must be a number" };
     fields.order = order;
   }
+  const translations = cleanTranslations(body.translations, ["name", "description"], { maxLength: 300 });
+  if (translations.error) return { error: translations.error };
+  if (translations.value !== undefined) fields.translations = translations.value;
   return { fields };
+};
+
+// Update: incoming az / ru texts merge into the stored ones.
+const mergedFields = (doc, fields) => {
+  if (fields.translations === undefined) return fields;
+  const current = doc.translations?.toObject ? doc.translations.toObject() : doc.translations;
+  return { ...fields, translations: mergeTranslations(current, fields.translations) };
 };
 
 /**
@@ -143,8 +164,10 @@ const updateCategory = asyncHandler(async (req, res) => {
   const { fields, error } = categoryFields(req.body || {});
   if (error) return badRequest(res, error);
 
-  category.set(fields);
+  category.set(mergedFields(category, fields));
   await category.save();
+  // Hiding / showing a category changes the public dishes.
+  if (fields.isActive !== undefined) await MenuService.syncRestaurant(category.restaurant);
   res.json({ success: true, message: "Category updated", data: { category } });
 });
 
@@ -240,6 +263,9 @@ const itemFields = async (body, restaurantId, { create = false, existing = null 
     if (order === null) return { error: "Order must be a number" };
     fields.order = order;
   }
+  const translations = cleanTranslations(body.translations, ["name", "description"], { maxLength: 500 });
+  if (translations.error) return { error: translations.error };
+  if (translations.value !== undefined) fields.translations = translations.value;
   return { fields };
 };
 
@@ -275,7 +301,7 @@ const updateItem = asyncHandler(async (req, res) => {
   if (error) return badRequest(res, error);
 
   const oldImage = item.image;
-  item.set(fields);
+  item.set(mergedFields(item, fields));
   await item.save();
   await MenuService.syncRestaurant(item.restaurant);
   if (oldImage && oldImage !== item.image) await MenuService.deleteImageIfUnused(oldImage);
@@ -307,17 +333,14 @@ const reorderItems = asyncHandler(async (req, res) => {
   if (!restaurant) return notFound(res, "Restaurant not found");
   const { ids, category } = req.body || {};
 
+  // Validate the target category and every id before anything is written.
+  let set = {};
   if (category !== undefined) {
     const { fields, error } = await itemFields({ category }, restaurant._id);
     if (error) return badRequest(res, error);
-    if (Array.isArray(ids) && ids.every(isObjectId)) {
-      await MenuItem.updateMany(
-        { restaurant: restaurant._id, _id: { $in: ids } },
-        { $set: { category: fields.category } },
-      );
-    }
+    set = { category: fields.category };
   }
-  const { error, updated } = await reorder(MenuItem, ids, { restaurant: restaurant._id });
+  const { error, updated } = await reorder(MenuItem, ids, { restaurant: restaurant._id }, set);
   if (error) return badRequest(res, error);
   await MenuService.syncRestaurant(restaurant._id);
   res.json({ success: true, message: "Order saved", data: { updated } });
@@ -394,4 +417,7 @@ export {
   setMenuPhotos,
   uploadMenuPhotos,
   uploadMenuImages,
+  // Shared with the bulk JSON import (adminImportController).
+  categoryFields,
+  itemFields,
 };

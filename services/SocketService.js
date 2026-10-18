@@ -102,7 +102,12 @@ class SocketService {
     this.io.to(`room:${roomId}`).emit(event, data);
   }
 
-  /** Force-disconnect every socket of a user (ban / suspend / delete). */
+  /**
+   * Force-disconnect every socket of a user (ban / suspend / delete). To sign
+   * an account out everywhere use AuthTokenService.revokeAll(), which calls
+   * this after revoking the tokens (role changes too: a reconnect reads the
+   * role fresh, so a demoted admin is out of the admins room).
+   */
   disconnectUser(userId) {
     if (!this.io || !userId) return;
     this.io.in(userRoom(userId)).disconnectSockets(true);

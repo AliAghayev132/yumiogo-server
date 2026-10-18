@@ -232,7 +232,10 @@ class LinkPreviewService {
       .replace(/<title>[\s\S]*?<\/title>\s*/i, "")
       .replace(/<meta\s+name=["'](?:description|robots)["'][^>]*>\s*/gi, "");
     // Before </head>: <meta charset> must stay within the first 1024 bytes.
-    return stripped.replace(/<\/head>/i, `  ${this.tags(meta, url, origin)}\n  </head>`);
+    // Replacer function: the tags carry user text, and a replacement STRING
+    // would expand "$`", "$'", "$&" in it (pasting chunks of the page).
+    const tags = `  ${this.tags(meta, url, origin)}\n  </head>`;
+    return stripped.replace(/<\/head>/i, () => tags);
   }
 
   /** Forget cached previews (tests / after bulk edits). */

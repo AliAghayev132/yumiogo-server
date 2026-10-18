@@ -20,6 +20,7 @@ import {
 import { SENTIMENT_SCORE } from "#models/review.model.js";
 import { httpError } from "#utils";
 import { foldText } from "#utils/search.js";
+import { allValues } from "#utils/translations.js";
 import { derivePriceLevel } from "#utils/pricing.js";
 import { HashService } from "./HashService.js";
 import { CatalogService } from "./CatalogService.js";
@@ -28,6 +29,7 @@ import { ReviewService } from "./ReviewService.js";
 import { RestaurantStatsService } from "./RestaurantStatsService.js";
 import { MenuService } from "./MenuService.js";
 import * as DEMO from "./seed/demoData.js";
+import { menuTranslations, restaurantTranslations } from "./seed/demoTranslations.js";
 
 /**
  * SeedService — the single source of truth for demo data ("Load mock data").
@@ -376,6 +378,8 @@ class DemoSeeder {
       const doc = await createSeed(Restaurant, {
         name: def.name,
         description: def.description,
+        // az / ru description, address (and a few names) — seed/demoTranslations.js.
+        translations: restaurantTranslations(def.key),
         cuisines: this.names("cuisine", def.cuisines),
         features: this.names("feature", def.features),
         tags: this.names("tag", def.tags),
@@ -420,7 +424,14 @@ class DemoSeeder {
       const sections = DEMO.MENUS[entry.def.menu] || [];
       const at = entry.createdAt;
       const cats = sections.map(([name], order) =>
-        seedDoc(MenuCategory, { restaurant: entry.doc._id, name, order, createdAt: at, updatedAt: at }),
+        seedDoc(MenuCategory, {
+          restaurant: entry.doc._id,
+          name,
+          translations: menuTranslations({ name }),
+          order,
+          createdAt: at,
+          updatedAt: at,
+        }),
       );
       // Some kitchens have one dish off the menu today ("unavailable").
       const hideOne = this.chance(0.35);
@@ -430,6 +441,7 @@ class DemoSeeder {
         dishes.forEach(([name, price, description, dietary, popular, image], order) => {
           const unavailable = hideOne && !hidden && !popular && ci === sections.length - 1;
           if (unavailable) hidden = true;
+          const translations = menuTranslations({ name, description });
           rows.push(
             seedDoc(MenuItem, {
               restaurant: entry.doc._id,
@@ -437,12 +449,14 @@ class DemoSeeder {
               name,
               price,
               description,
+              translations,
               dietary: this.names("dietary", dietary),
               isPopular: !!popular,
               isAvailable: !unavailable,
               image: image || null,
               order,
-              searchKey: foldText(name),
+              // Every language, like MenuItem's pre-save hook (insertMany skips it).
+              searchKey: foldText(allValues({ name, translations }, "name").join(" ")),
               createdAt: at,
               updatedAt: at,
             }),
@@ -1156,7 +1170,15 @@ class DemoSeeder {
           message: def.status === "resolved"
             ? `Your report about ${about} was reviewed and action was taken.${suffix}`
             : `Your report about ${about} was reviewed. No action was taken.${suffix}`,
-          data: { reportId: String(report._id), reportStatus: def.status },
+          data: {
+            reportId: String(report._id),
+            reportStatus: def.status,
+            // Shown in the reader's language (NOTIFICATION_COPY.system).
+            i18n: {
+              key: def.status === "resolved" ? "report_resolved" : "report_dismissed",
+              values: { about: report.targetLabel || "", targetType: kind, note: def.note || "" },
+            },
+          },
           at: resolvedAt,
         });
       }
@@ -1216,7 +1238,7 @@ class DemoSeeder {
           type: "system",
           title: "You received a warning",
           message: `The Yumio team issued you a warning: ${w.reason}`,
-          data: { kind: "warning" },
+          data: { kind: "warning", i18n: { key: "warning", values: { reason: w.reason } } },
           at: w.createdAt,
         }),
       ),

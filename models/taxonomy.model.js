@@ -2,6 +2,7 @@ import { Schema, Model, TAXONOMY_TYPES } from "#constants";
 // Imported directly (not via the #services barrel) to avoid a models <-> services
 // circular import through BootstrapService.
 import { EncryptionService } from "#services/EncryptionService.js";
+import { translationsField } from "#utils/translations.js";
 
 /**
  * Taxonomy — one admin-managed catalog item (a cuisine, feature, tag, dietary
@@ -50,6 +51,8 @@ const taxonomySchema = new Schema(
     showInOnboarding: { type: Boolean, default: false },
     // Only meaningful for review labels → section heading ("Good for", "What was wrong?").
     group: { type: String, default: "", trim: true, maxlength: 40 },
+    // az / ru texts; `name` / `description` / `group` above are English.
+    translations: translationsField(["name", "description", "group"]),
   },
   {
     timestamps: true,

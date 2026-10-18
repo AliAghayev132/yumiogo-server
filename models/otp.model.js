@@ -6,9 +6,11 @@ import { Schema, Model, otpTypes } from "#constants";
  * OTP — one pending e-mail verification code per (email, type).
  *
  * - Codes are 4 digits (Figma shows 4 boxes) and stored only as an HMAC.
- * - Wrong guesses are counted atomically per code (MAX_ATTEMPTS) and per
- *   window (MAX_FAILURES), so neither parallel guessing nor asking for a new
- *   code resets the brute-force budget.
+ * - Every guess is charged atomically BEFORE the comparison, both per code
+ *   (MAX_ATTEMPTS) and per window (MAX_FAILURES; refunded when the guess was
+ *   right), so neither parallel guessing nor asking for a new code goes past
+ *   the brute-force budget. Failed verifications are also capped per IP across
+ *   addresses (otpVerifyLimiter, middlewares/security.js).
  * - Sending is throttled per address: RESEND_COOLDOWN between sends and at
  *   most MAX_SENDS per window (also stops e-mail bombing).
  * The document lives for the whole window (TTL on `expiresAt`); the code
@@ -18,9 +20,9 @@ export const OTP_POLICY = {
   CODE_LENGTH: 4,
   CODE_TTL: config.otpExpiresIn || 600, // seconds a code stays valid
   RESEND_COOLDOWN: 60, // seconds between two sends
-  MAX_ATTEMPTS: 5, // wrong guesses per code
+  MAX_ATTEMPTS: 3, // wrong guesses per code
   MAX_SENDS: 8, // codes per window
-  MAX_FAILURES: 10, // wrong guesses per window
+  MAX_FAILURES: 6, // wrong guesses per window
   WINDOW: 24 * 60 * 60, // seconds
 };
 
@@ -244,7 +246,8 @@ otpSchema.statics.rollbackSend = async function (otp) {
 };
 
 /**
- * Check a code. Attempts are counted atomically before comparing.
+ * Check a code. The guess is charged (attempts AND failures) atomically
+ * before comparing; a right guess gets its failure back.
  * → { valid: true, data } | { valid: false, error, errorCode, attemptsLeft? }
  */
 otpSchema.statics.verifyCode = async function (email, code, type) {
@@ -261,7 +264,7 @@ otpSchema.statics.verifyCode = async function (email, code, type) {
       attempts: { $lt: OTP_POLICY.MAX_ATTEMPTS },
       failures: { $lt: OTP_POLICY.MAX_FAILURES },
     },
-    { $inc: { attempts: 1 } },
+    { $inc: { attempts: 1, failures: 1 } },
     { returnDocument: "after" },
   );
 
@@ -285,19 +288,22 @@ otpSchema.statics.verifyCode = async function (email, code, type) {
   }
 
   if (!/^\d+$/.test(input) || !sameHash(hashCode(address, type, input), otp.codeHash)) {
-    await this.updateOne({ _id: otp._id }, { $inc: { failures: 1 } });
     return {
       valid: false,
       error: "Invalid verification code",
       errorCode: "OTP_INVALID",
-      attemptsLeft: Math.max(0, OTP_POLICY.MAX_ATTEMPTS - otp.attempts),
+      attemptsLeft: Math.max(
+        0,
+        Math.min(OTP_POLICY.MAX_ATTEMPTS - otp.attempts, OTP_POLICY.MAX_FAILURES - otp.failures),
+      ),
     };
   }
 
-  // Single use: only one parallel request can flip verified.
+  // Single use: only one parallel request can flip verified (and the right
+  // guess is not counted as a failure).
   const claimed = await this.findOneAndUpdate(
-    { _id: otp._id, verified: false },
-    { $set: { verified: true } },
+    { _id: otp._id, verified: false, codeHash: otp.codeHash },
+    { $set: { verified: true }, $inc: { failures: -1 } },
     { returnDocument: "after" },
   );
   if (!claimed) {

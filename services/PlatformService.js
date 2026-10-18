@@ -19,6 +19,11 @@ const CACHE_TTL_MS = 5000;
 
 const DEFAULT_MAINTENANCE_MESSAGE =
   "Yumio is getting a few improvements. Please check back soon.";
+// The default message in az / ru (used while the admin message is the default).
+const DEFAULT_MAINTENANCE_MESSAGES = {
+  az: "Yumio bir neçə təkmilləşdirmə alır. Zəhmət olmasa, bir azdan yenidən yoxlayın.",
+  ru: "Yumio становится лучше. Пожалуйста, загляните чуть позже.",
+};
 
 // Typed confirmations the admin must send to POST /admin/seed and /admin/reset.
 const DEMO_CONFIRMATIONS = {
@@ -62,9 +67,14 @@ class PlatformService {
   /** { enabled, message } */
   static async maintenance() {
     const s = await this.settings();
+    const messages = Object.fromEntries(
+      Object.entries(s.translations || {}).map(([lang, entry]) => [lang, entry?.maintenanceMessage || ""]),
+    );
     return {
       enabled: !!s.maintenanceMode,
       message: s.maintenanceMessage || DEFAULT_MAINTENANCE_MESSAGE,
+      // az / ru versions the admin wrote ("" → the English message).
+      messages,
     };
   }
 
@@ -147,12 +157,42 @@ class PlatformService {
     });
   }
 
-  /** Push the maintenance switch to every connected client. */
-  static broadcastMaintenance({ enabled, message }) {
-    socketService.broadcast("app:maintenance", {
-      maintenance: !!enabled,
-      message: message || DEFAULT_MAINTENANCE_MESSAGE,
-    });
+  /**
+   * Push the maintenance switch to every connected client:
+   * { maintenance, message (English), messages: { en, az, ru } } — the app shows
+   * messages[its language] (an empty az / ru text falls back to English).
+   * `messages` defaults to the az / ru texts saved in Settings.
+   */
+  static async broadcastMaintenance({ enabled, message, messages = null }) {
+    const english = message || DEFAULT_MAINTENANCE_MESSAGE;
+    let translated = messages;
+    if (!translated) {
+      try {
+        this.invalidate();
+        translated = (await this.maintenance()).messages;
+      } catch (error) {
+        console.error("Maintenance broadcast: settings read failed:", error.message);
+        translated = {};
+      }
+    }
+    const isDefault = english === DEFAULT_MAINTENANCE_MESSAGE;
+    const byLanguage = Object.fromEntries(
+      APP_LANGUAGES.map((lang) => {
+        if (lang === "en") return [lang, english];
+        const text = String(translated?.[lang] || "").trim();
+        return [lang, text || (isDefault && DEFAULT_MAINTENANCE_MESSAGES[lang]) || english];
+      }),
+    );
+    try {
+      socketService.broadcast("app:maintenance", {
+        maintenance: !!enabled,
+        message: english,
+        messages: byLanguage,
+      });
+    } catch (error) {
+      // Callers fire and forget — never an unhandled rejection.
+      console.error("Maintenance broadcast failed:", error.message);
+    }
   }
 }
 

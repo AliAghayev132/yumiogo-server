@@ -2,6 +2,7 @@ import { crypto } from "#lib";
 import { Restaurant, RestaurantView, FavoriteList, Review } from "#models";
 import { getTimezone } from "#utils/openingHours.js";
 import { CatalogService } from "./CatalogService.js";
+import { ReviewService } from "./ReviewService.js";
 
 /**
  * RestaurantStatsService — real, time-windowed activity for "Top restaurants
@@ -12,7 +13,7 @@ import { CatalogService } from "./CatalogService.js";
  *    refreshing a profile cannot farm the rankings.
  *  - refreshAll(): recomputes Restaurant.stats (7-day / previous 7-day / 30-day
  *    views, saves from FavoriteList item savedAt, reviews + 30-day average
- *    score) at boot and every 10 minutes.
+ *    score and liked share) at boot and every 10 minutes.
  */
 
 const REFRESH_INTERVAL_MS = 10 * 60 * 1000;
@@ -30,6 +31,8 @@ const STAT_FIELDS = [
   "reviewsPrev7d",
   "reviews30d",
   "rating30d",
+  "liked30d",
+  "likedPercent30d",
   "popularity7d",
   "trending30d",
   "rise",
@@ -110,6 +113,9 @@ class RestaurantStatsService {
       },
     });
 
+    // Public reviews only — approved, live, author active (same rule as the rating).
+    const reviewMatch = await ReviewService.publicFilter({ createdAt: { $gte: t30 } });
+
     const [views, saves, reviews, restaurants] = await Promise.all([
       RestaurantView.aggregate([
         { $match: { day: { $gte: d30 } } },
@@ -138,8 +144,7 @@ class RestaurantStatsService {
         },
       ]),
       Review.aggregate([
-        // Published reviews only (reviews without a status predate moderation).
-        { $match: { isDeleted: false, status: { $in: ["approved", null] }, createdAt: { $gte: t30 } } },
+        { $match: reviewMatch },
         {
           $group: {
             _id: "$restaurant",
@@ -147,6 +152,7 @@ class RestaurantStatsService {
             rp7: inWindow("$createdAt", t14, t7),
             r30: { $sum: 1 },
             avg: { $avg: "$score" },
+            liked: { $sum: { $cond: [{ $eq: ["$sentiment", "liked"] }, 1, 0] } },
           },
         },
       ]),
@@ -175,6 +181,8 @@ class RestaurantStatsService {
         reviewsPrev7d: r.rp7 || 0,
         reviews30d: r.r30 || 0,
         rating30d: r.avg ? Math.round(r.avg * 100) / 100 : 0,
+        liked30d: r.liked || 0,
+        likedPercent30d: r.r30 ? Math.round(((r.liked || 0) * 100) / r.r30) : 0,
       };
       next.popularity7d = activity(next.views7d, next.saves7d, next.reviews7d);
       next.trending30d = activity(next.views30d, next.saves30d, next.reviews30d);

@@ -1,3 +1,4 @@
+import { mongoose } from "#lib";
 import { FavoriteList, Report, User } from "#models";
 import { favoritePrivacy } from "#constants";
 import { ModerationService } from "#services";
@@ -8,7 +9,7 @@ import { asyncHandler, escapeRegex } from "#utils";
  * up in feeds and share links, so the admin can find, inspect and remove them.
  *
  *   GET    /api/admin/lists?page&limit&search&privacy&owner&deleted=true
- *   GET    /api/admin/lists/:id
+ *   GET    /api/admin/lists/:id   (+ savedBy: who saved it, latest 50)
  *   DELETE /api/admin/lists/:id { reason? }   (also ?reason=)
  */
 
@@ -62,40 +63,43 @@ const openReportCounts = async (ids) => {
 
 /**
  * GET /api/admin/lists → { lists, pagination, counts: { all, public, collaborative, private, deleted } }
- * search: list name or owner name / email.
+ * search: list name or owner name / email. The tab counts follow the owner / search filters
+ * (not the privacy / deleted tab itself).
  */
 const listLists = asyncHandler(async (req, res) => {
   const { page, limit, skip } = pageParams(req.query);
   const deleted = req.query.deleted === "true";
-  const filter = { isDeleted: deleted };
+  // Owner + search: shared by the rows and the tab counts.
+  const base = {};
 
   const privacy = String(req.query.privacy || "");
   if (privacy && privacy !== "all") {
     if (!favoritePrivacy.includes(privacy)) {
       return badRequest(res, `privacy must be one of: all, ${favoritePrivacy.join(", ")}`);
     }
-    filter.privacy = privacy;
   }
   if (req.query.owner) {
     if (!/^[a-f0-9]{24}$/i.test(String(req.query.owner))) return badRequest(res, "Invalid owner id");
-    filter.owner = req.query.owner;
+    base.owner = new mongoose.Types.ObjectId(String(req.query.owner));
   }
   const search = String(req.query.search || "").trim().slice(0, 100);
   if (search) {
     const rx = { $regex: escapeRegex(search), $options: "i" };
     const owners = await User.distinct("_id", { $or: [{ firstName: rx }, { lastName: rx }, { email: rx }] });
-    filter.$or = [{ name: rx }, { owner: { $in: owners } }];
+    base.$or = [{ name: rx }, { owner: { $in: owners } }];
   }
+  const filter = { ...base, isDeleted: deleted, ...(privacy && privacy !== "all" ? { privacy } : {}) };
 
   const [lists, total, counts] = await Promise.all([
     FavoriteList.find(filter)
-      .sort({ updatedAt: -1 })
+      .sort({ updatedAt: -1, _id: -1 })
       .skip(skip)
       .limit(limit)
       .populate("owner", OWNER_FIELDS)
       .lean(),
     FavoriteList.countDocuments(filter),
     FavoriteList.aggregate([
+      { $match: base },
       { $group: { _id: { deleted: "$isDeleted", privacy: "$privacy" }, count: { $sum: 1 } } },
     ]),
   ]);
@@ -120,13 +124,23 @@ const listLists = asyncHandler(async (req, res) => {
   });
 });
 
-/** GET /api/admin/lists/:id → { list (+ items, collaborators), reports } */
+const SAVED_BY_LIMIT = 50;
+
+/**
+ * GET /api/admin/lists/:id → { list (+ items, collaborators, savedBy), reports }
+ * savedBy: the latest SAVED_BY_LIMIT people who saved the list (saveCount has the total).
+ */
 const getList = asyncHandler(async (req, res) => {
   const list = await FavoriteList.findById(req.params.id)
     .populate("owner", OWNER_FIELDS)
     .populate("items.restaurant", RESTAURANT_FIELDS)
     .populate("collaborators.user", "firstName lastName avatar")
     .lean();
+  const savedBy = list
+    ? await User.find({ _id: { $in: (list.followers || []).slice(-SAVED_BY_LIMIT) } })
+        .select("firstName lastName avatar verified status isDeleted")
+        .lean()
+    : [];
   if (!list) return notFound(res);
   const reports = await Report.find({ targetType: "list", targetId: list._id })
     .sort({ createdAt: -1 })
@@ -157,6 +171,15 @@ const getList = asyncHandler(async (req, res) => {
         collaborators: (list.collaborators || []).map((c) => ({
           user: c.user ? { _id: c.user._id, firstName: c.user.firstName, lastName: c.user.lastName, avatar: c.user.avatar || null } : null,
           role: c.role,
+        })),
+        savedBy: savedBy.map((u) => ({
+          _id: u._id,
+          firstName: u.firstName,
+          lastName: u.lastName,
+          avatar: u.avatar || null,
+          verified: !!u.verified,
+          status: u.status,
+          isDeleted: !!u.isDeleted,
         })),
       },
       reports: reports.map((r) => ({

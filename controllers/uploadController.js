@@ -20,7 +20,9 @@ import { asyncHandler } from "#utils";
  * Non-admin uploads (review photos) have a rolling per-user quota: at most
  * USER_QUOTA.files files / USER_QUOTA.bytes bytes in the last 24 hours (files
  * never attached to a review are deleted after a day anyway) → 429
- * UPLOAD_QUOTA, so one account cannot fill the disk.
+ * UPLOAD_QUOTA, so one account cannot fill the disk. The check and the
+ * writes run under a per-user lock, so parallel requests can't all pass the
+ * check before any of them stored its files (per process).
  *
  * Stored values are RELATIVE paths ("uploads/...") — clients resolve them
  * against their API origin (admin: getImageUrl, mobile: resolveImage).
@@ -53,6 +55,25 @@ const recentUsage = async (dir) => {
   return stats
     .filter((st) => st?.isFile() && st.mtimeMs >= since)
     .reduce((acc, st) => ({ files: acc.files + 1, bytes: acc.bytes + st.size }), { files: 0, bytes: 0 });
+};
+
+// Per-user critical sections (quota check + writes), chained promises.
+const userLocks = new Map(); // userId → tail promise
+const withUserLock = async (key, fn) => {
+  const previous = userLocks.get(key) || Promise.resolve();
+  let release;
+  const mine = new Promise((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => mine);
+  userLocks.set(key, tail);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (userLocks.get(key) === tail) userLocks.delete(key);
+  }
 };
 
 // FileService.validateFile status → stable error code.
@@ -93,23 +114,29 @@ const uploadImages = asyncHandler(async (req, res) => {
     }
   }
 
-  if (!kind.adminOnly && req.user.role !== "admin") {
-    const used = await recentUsage(kind.dir(req));
-    const incoming = files.reduce((sum, file) => sum + (file.size || 0), 0);
-    if (used.files + files.length > USER_QUOTA.files || used.bytes + incoming > USER_QUOTA.bytes) {
-      return res.status(429).json({
-        success: false,
-        message: "You have uploaded a lot of photos today. Please try again tomorrow.",
-        code: "UPLOAD_QUOTA",
-      });
+  const quota = !kind.adminOnly && req.user.role !== "admin";
+  const store = async () => {
+    if (quota) {
+      const used = await recentUsage(kind.dir(req));
+      const incoming = files.reduce((sum, file) => sum + (file.size || 0), 0);
+      if (used.files + files.length > USER_QUOTA.files || used.bytes + incoming > USER_QUOTA.bytes) return null;
     }
-  }
+    const subDir = kind.dir(req).replace(/^uploads\//, "");
+    const urls = [];
+    for (const file of files) {
+      const saved = await FileService.saveFile(file, subDir);
+      urls.push(saved.path); // "uploads/reviews/<userId>/<random>.jpg"
+    }
+    return urls;
+  };
 
-  const subDir = kind.dir(req).replace(/^uploads\//, "");
-  const urls = [];
-  for (const file of files) {
-    const saved = await FileService.saveFile(file, subDir);
-    urls.push(saved.path); // "uploads/reviews/<userId>/<random>.jpg"
+  const urls = quota ? await withUserLock(String(req.user._id), store) : await store();
+  if (!urls) {
+    return res.status(429).json({
+      success: false,
+      message: "You have uploaded a lot of photos today. Please try again tomorrow.",
+      code: "UPLOAD_QUOTA",
+    });
   }
 
   res.status(201).json({ success: true, message: "Uploaded", data: { urls } });

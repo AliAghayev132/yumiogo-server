@@ -87,6 +87,16 @@ const reportSchema = new Schema(
 reportSchema.index({ status: 1, createdAt: -1 });
 reportSchema.index({ targetType: 1, targetId: 1, status: 1 });
 reportSchema.index({ reporter: 1, targetType: 1, targetId: 1 });
+// At most one OPEN report per reporter and target — a double tap can't file two
+// (createReport answers 409 REPORT_DUPLICATE on the duplicate-key error).
+reportSchema.index(
+  { reporter: 1, targetType: 1, targetId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { status: { $in: ["open", "in_review"] } },
+    name: "reporter_target_open_unique",
+  },
+);
 
 reportSchema.pre("save", async function () {
   if (this.isNew && !this.number) this.number = await Counter.next("report");

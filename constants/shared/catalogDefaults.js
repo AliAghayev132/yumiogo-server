@@ -283,7 +283,7 @@ const DEFAULT_PAGES = [
       ["What is Yumio?", "Yumio is a food discovery platform that helps you find restaurants, cafes, and dining spots that match your personal taste and mood.\n\nYumio does not operate restaurants or take reservations. We connect people with places through community-driven content, reviews, and curated lists.\n\n> Yumio is a discovery tool — not a booking or delivery service. Our goal is to help you find your perfect place to eat."],
       ["Reviews & User Content", "When you submit a review or list, you grant Yumio a worldwide, royalty-free license to use, display, and distribute that content on the platform.\n\nYou are solely responsible for the accuracy of your reviews. Yumio does not verify reviews but reserves the right to remove content that violates our community guidelines.\n\n> Reviews must be honest and based on genuine experience. Fake or incentivized reviews are strictly prohibited."],
       ["Restaurant Ratings", "Ratings on Yumio are calculated based on aggregated user reviews. No restaurant can pay to alter or improve their rating.\n\nRatings are updated in real time as new reviews are submitted. A restaurant's overall score reflects the average of all verified user ratings."],
-      ["Your Data & Rights", "You have the right to access, correct, or delete your personal data at any time. You can download a copy of your data from Profile → Settings → Download my data.\n\nWe do not sell your personal data to third parties. Data is used solely to improve your Yumio experience."],
+      ["Your Data", "We do not sell your personal data to third parties."],
     ].map(section),
   },
   {
@@ -530,6 +530,10 @@ const DEFAULT_SETTINGS = {
   appVersion: { minSupported: "", latest: "" },
   // Feed "Invite friends 0/3" card: friends to invite (1–20).
   inviteGoal: 3,
+  // Liked-percentage rating: cards / profile show "92% liked"
+  // (Restaurant.reviewStats.likedPercent) from this many public reviews (1–100);
+  // the same threshold ranks the "best rated" sort.
+  ratingDisplay: { minReviewsForPercent: 10 },
   homeSections: [
     { key: "cuisines", title: "Cuisines", limit: 30 },
     { key: "nearYou", title: "Near you", limit: 10 },
@@ -560,6 +564,15 @@ const DEFAULT_SETTINGS = {
     ...s,
     order,
   })),
+};
+
+// The last Privacy section as shipped until the "data & rights" copy was cut
+// down to the "we do not sell" statement (DEFAULT_PAGES above). ensureDefaults()
+// applies the same edit to a stored page only while that section still equals
+// this text (CatalogService.migratePrivacyDataSection).
+const LEGACY_PRIVACY_DATA_SECTION = {
+  heading: "Your Data & Rights",
+  body: "You have the right to access, correct, or delete your personal data at any time. You can download a copy of your data from Profile → Settings → Download my data.\n\nWe do not sell your personal data to third parties. Data is used solely to improve your Yumio experience.",
 };
 
 // Legal pages as first seeded; ensureDefaults() replaces a page with the Figma
@@ -671,6 +684,7 @@ export {
   DEFAULT_TRENDING_COLLAGE,
   LEGACY_SETTINGS,
   LEGACY_PAGES,
+  LEGACY_PRIVACY_DATA_SECTION,
   ONBOARDING_CUISINES,
   ONBOARDING_DIETARY,
   ONBOARDING_ALIASES,

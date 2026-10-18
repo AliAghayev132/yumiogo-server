@@ -141,6 +141,9 @@ const notificationTypes = [
   "list_save",
   "list_visit",
   "review_like",
+  // X tagged you in their review ("Who did you go with?") / X liked your comment.
+  "review_tag",
+  "comment_like",
   "comment",
   "reply",
   "mention",
@@ -152,6 +155,9 @@ const notificationTypes = [
   // A followed restaurant started a discount / added dishes (RestaurantFollowService).
   "restaurant_offer",
   "restaurant_menu",
+  // Private accounts: X asked to follow you / X accepted your request (FollowRequestService).
+  "follow_request",
+  "follow_accept",
 ];
 
 export {

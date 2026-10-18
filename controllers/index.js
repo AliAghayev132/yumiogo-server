@@ -18,3 +18,5 @@ export * as adminMenuController from "./adminMenuController.js";
 export * as placesController from "./placesController.js";
 export * as restaurantFollowController from "./restaurantFollowController.js";
 export * as adminListController from "./adminListController.js";
+export * as adminTranslateController from "./adminTranslateController.js";
+export * as adminImportController from "./adminImportController.js";

@@ -1,6 +1,6 @@
 import { Faq, ContentPage, OnboardingSlide, Restaurant, Review, Taxonomy } from "#models";
 import { faqAudiences } from "#constants";
-import { CatalogService } from "#services";
+import { CatalogService, ReviewService } from "#services";
 import { asyncHandler } from "#utils";
 
 /**
@@ -19,7 +19,7 @@ const listFaqs = asyncHandler(async (req, res) => {
     filter.audience = { $in: [audience, "both"] };
   }
 
-  const faqs = await Faq.find(filter, "question answer category order")
+  const faqs = await Faq.find(filter, "question answer category order translations")
     .sort({ order: 1, createdAt: 1 })
     .lean();
   res.json({ success: true, data: { faqs } });
@@ -30,7 +30,7 @@ const listFaqs = asyncHandler(async (req, res) => {
  * GET /api/content/pages
  */
 const listPages = asyncHandler(async (req, res) => {
-  const pages = await ContentPage.find({ isPublished: true }, "-_id slug title updatedAt")
+  const pages = await ContentPage.find({ isPublished: true }, "-_id slug title updatedAt translations.az.title translations.ru.title")
     .sort({ createdAt: 1, slug: 1 })
     .lean();
   res.json({ success: true, data: { pages } });
@@ -46,7 +46,7 @@ const getPage = asyncHandler(async (req, res) => {
   const [page, settings] = await Promise.all([
     ContentPage.findOne(
       { slug: String(req.params.slug).toLowerCase(), isPublished: true },
-      "-_id slug title intro sections updatedAt",
+      "-_id slug title intro sections updatedAt translations",
     ).lean(),
     CatalogService.getSettings(),
   ]);
@@ -63,7 +63,7 @@ const getPage = asyncHandler(async (req, res) => {
 const listOnboarding = asyncHandler(async (req, res) => {
   const slides = await OnboardingSlide.find(
     { isActive: true },
-    "title subtitle icon image order",
+    "title subtitle icon image order translations",
   )
     .sort({ order: 1, createdAt: 1 })
     .lean();
@@ -75,11 +75,18 @@ const listOnboarding = asyncHandler(async (req, res) => {
  * GET /api/content/stats
  */
 const getStats = asyncHandler(async (req, res) => {
-  const activeRestaurant = { status: "active", isDeleted: false };
+  const activeRestaurant = { ...ReviewService.ACTIVE_RESTAURANT };
+  // Public reviews only: approved, by active authors, of active restaurants.
+  const hiddenRestaurants = await Restaurant.distinct("_id", {
+    $or: [{ isDeleted: true }, { status: { $ne: "active" } }],
+  });
+  const publicReviews = await ReviewService.publicFilter(
+    hiddenRestaurants.length ? { restaurant: { $nin: hiddenRestaurants } } : {},
+  );
   const [restaurants, reviews, liked, usedCuisines, activeCuisines] = await Promise.all([
     Restaurant.countDocuments(activeRestaurant),
-    Review.countDocuments({ isDeleted: false }),
-    Review.countDocuments({ isDeleted: false, sentiment: "liked" }),
+    Review.countDocuments(publicReviews),
+    Review.countDocuments({ ...publicReviews, sentiment: "liked" }),
     Restaurant.distinct("cuisines", activeRestaurant),
     Taxonomy.distinct("name", { type: "cuisine", isActive: true }),
   ]);

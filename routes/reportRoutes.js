@@ -10,7 +10,7 @@ const reportLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 20,
   keyGenerator: (req) => String(req.user?._id),
-  message: { success: false, message: "Too many reports. Please try again later." },
+  message: { success: false, message: "Too many reports. Please try again later.", code: "REPORT_RATE_LIMITED" },
   standardHeaders: true,
   legacyHeaders: false,
 });

@@ -1,5 +1,15 @@
 import { crypto } from "#lib";
-import { User, Restaurant, Review, Report, FavoriteList, Notification } from "#models";
+import {
+  User,
+  Restaurant,
+  Review,
+  Report,
+  FavoriteList,
+  Notification,
+  Comment,
+  RestaurantFollow,
+  FollowRequest,
+} from "#models";
 import {
   SeedService,
   DataWipeService,
@@ -167,11 +177,16 @@ const people = (n) => (n === 1 ? "1 person" : `${n} people`);
 /**
  * How many accounts a broadcast would reach (the Broadcast page shows it
  * before sending). The sending admin counts when they are in the audience.
- * GET /api/admin/notifications/audience?segment=&city=
+ * GET /api/admin/notifications/audience?segment=&city=&userIds=<id,id,…>
  * → { recipients, includesYou }
  */
 const getBroadcastAudience = asyncHandler(async (req, res) => {
-  const { filter } = broadcastAudience({ segment: str(req.query.segment), city: str(req.query.city, 80) });
+  const userIds = str(req.query.userIds, 30000);
+  const { filter } = broadcastAudience({
+    segment: str(req.query.segment),
+    city: str(req.query.city, 80),
+    userIds: userIds ? userIds.split(",").map((id) => id.trim()).filter(Boolean) : undefined,
+  });
   const [recipients, includesYou] = await Promise.all([
     User.countDocuments(filter),
     User.exists({ ...filter, _id: req.user._id }).then(Boolean),
@@ -278,11 +293,12 @@ const userFilters = (query) => {
   return { filter, base };
 };
 
+// Every sort ends with _id so skip / limit pages never repeat or drop rows on ties.
 const USER_SORTS = {
-  newest: { createdAt: -1 },
-  oldest: { createdAt: 1 },
-  name: { firstName: 1, lastName: 1 },
-  lastLogin: { lastLogin: -1 },
+  newest: { createdAt: -1, _id: -1 },
+  oldest: { createdAt: 1, _id: 1 },
+  name: { firstName: 1, lastName: 1, _id: 1 },
+  lastLogin: { lastLogin: -1, _id: -1 },
 };
 const userSort = (value) => {
   const key = str(value) || "newest";
@@ -354,12 +370,17 @@ const exportUsers = asyncHandler(async (req, res) => {
 /**
  * User detail — profile, counters, recent reviews, lists, warnings, reports.
  * GET /api/admin/users/:id
+ * → { user (+ invitedBy { _id, firstName, lastName }, followRequestCount = pending requests to
+ *     follow this account), stats: { reviews, lists, followers, following, warnings, reportsAgainst,
+ *     reportsFiled, comments, restaurantsFollowed, invited, followRequests },
+ *     recentReviews, lists, reports }
  */
 const getUser = asyncHandler(async (req, res) => {
   const user = await User.findOne({ _id: req.params.id, isDeleted: false })
     .select(HIDDEN_USER_FIELDS)
     .populate("warnings.by", "firstName lastName")
-    .populate("statusChangedBy", "firstName lastName");
+    .populate("statusChangedBy", "firstName lastName")
+    .populate("invitedBy", "firstName lastName isDeleted");
   if (!user) throw httpError(404, "User not found");
   const uid = user._id;
 
@@ -369,6 +390,10 @@ const getUser = asyncHandler(async (req, res) => {
     followers,
     reportsAgainst,
     reportsFiled,
+    comments,
+    restaurantsFollowed,
+    invited,
+    followRequests,
     recentReviews,
     recentLists,
     reports,
@@ -378,6 +403,10 @@ const getUser = asyncHandler(async (req, res) => {
     User.countDocuments({ following: uid, isDeleted: false }),
     Report.countDocuments({ targetType: "user", targetId: uid }),
     Report.countDocuments({ reporter: uid }),
+    Comment.countDocuments({ user: uid, isDeleted: false }),
+    RestaurantFollow.countDocuments({ user: uid }),
+    User.countDocuments({ invitedBy: uid, isDeleted: false }),
+    FollowRequest.countDocuments({ target: uid }),
     Review.find({ user: uid, isDeleted: false })
       .sort({ createdAt: -1 })
       .limit(5)
@@ -400,7 +429,7 @@ const getUser = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: {
-      user: toAdminUser(user, { reviewCount: reviews }),
+      user: toAdminUser(user, { reviewCount: reviews, followRequestCount: followRequests }),
       stats: {
         reviews,
         lists,
@@ -409,10 +438,119 @@ const getUser = asyncHandler(async (req, res) => {
         warnings: (user.warnings || []).length,
         reportsAgainst,
         reportsFiled,
+        comments,
+        restaurantsFollowed,
+        invited,
+        followRequests,
       },
       recentReviews,
       lists: recentLists.map(({ items, ...list }) => ({ ...list, itemCount: (items || []).length })),
       reports,
+    },
+  });
+});
+
+/**
+ * Reports a user filed (newest first).
+ * GET /api/admin/users/:id/reports?page&limit (≤ 50)
+ * → { reports: [{ _id, number, targetType, targetId, targetLabel, reason, description, status,
+ *     action, resolvedAt, createdAt }], pagination }
+ */
+const listUserReports = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = paging(req.query);
+  // Deleted accounts keep their reports, so only the id has to exist.
+  if (!(await User.exists({ _id: req.params.id }))) throw httpError(404, "User not found");
+  const filter = { reporter: req.params.id };
+  const [reports, total] = await Promise.all([
+    Report.find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit)
+      .select("number targetType targetId targetLabel reason description status action resolvedAt createdAt")
+      .lean(),
+    Report.countDocuments(filter),
+  ]);
+  res.json({ success: true, data: { reports, pagination: pageInfo(page, limit, total) } });
+});
+
+/**
+ * Comments a user wrote on reviews (newest first, deleted ones included and marked).
+ * GET /api/admin/users/:id/comments?page&limit (≤ 50)
+ * → { comments: [{ _id, text, isDeleted, isReply, likeCount, replyCount, createdAt,
+ *     review: { _id, number, isDeleted, restaurant: { _id, name } } | null }], pagination }
+ */
+const listUserComments = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = paging(req.query);
+  if (!(await User.exists({ _id: req.params.id }))) throw httpError(404, "User not found");
+  const filter = { user: req.params.id };
+  const [comments, total] = await Promise.all([
+    Comment.find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit)
+      .select("review parent text isDeleted likeCount replyCount createdAt")
+      .populate({
+        path: "review",
+        select: "number restaurant isDeleted",
+        populate: { path: "restaurant", select: "name" },
+      })
+      .lean(),
+    Comment.countDocuments(filter),
+  ]);
+  res.json({
+    success: true,
+    data: {
+      comments: comments.map((c) => ({
+        _id: c._id,
+        text: c.isDeleted ? "" : c.text,
+        isDeleted: !!c.isDeleted,
+        isReply: !!c.parent,
+        likeCount: c.likeCount || 0,
+        replyCount: c.replyCount || 0,
+        createdAt: c.createdAt,
+        review: c.review
+          ? {
+              _id: c.review._id,
+              number: c.review.number ?? null,
+              isDeleted: !!c.review.isDeleted,
+              restaurant: c.review.restaurant ? { _id: c.review.restaurant._id, name: c.review.restaurant.name } : null,
+            }
+          : null,
+      })),
+      pagination: pageInfo(page, limit, total),
+    },
+  });
+});
+
+/**
+ * Signed-in devices — push-registered devices and the refresh-token sessions
+ * (one per signed-in device), without any token / session identifier.
+ * A session is active while its token version is current and it has not expired.
+ * GET /api/admin/users/:id/sessions
+ * → { pushDevices, activeSessions, lastLogin,
+ *     sessions: [{ active, rememberMe, lastRefreshAt, expiresAt }] (latest refresh first) }
+ */
+const getUserSessions = asyncHandler(async (req, res) => {
+  const user = await User.findOne({ _id: req.params.id, isDeleted: false })
+    .select("+refreshSessions pushTokens tokenVersion lastLogin")
+    .lean();
+  if (!user) throw httpError(404, "User not found");
+  const now = Date.now();
+  const sessions = (user.refreshSessions || [])
+    .map((s) => ({
+      active: (s.version ?? 0) === (user.tokenVersion ?? 0) && new Date(s.expiresAt).getTime() > now,
+      rememberMe: !!s.rememberMe,
+      lastRefreshAt: s.rotatedAt || null,
+      expiresAt: s.expiresAt || null,
+    }))
+    .sort((a, b) => new Date(b.lastRefreshAt || 0) - new Date(a.lastRefreshAt || 0));
+  res.json({
+    success: true,
+    data: {
+      pushDevices: (user.pushTokens || []).length,
+      activeSessions: sessions.filter((s) => s.active).length,
+      lastLogin: user.lastLogin || null,
+      sessions,
     },
   });
 });
@@ -593,14 +731,15 @@ const deleteUser = asyncHandler(async (req, res) => {
 // Restaurants
 // =================================================================
 
+// Every sort ends with _id so skip / limit pages never repeat or drop rows on ties.
 const RESTAURANT_SORTS = {
-  newest: { createdAt: -1 },
-  oldest: { createdAt: 1 },
-  name: { name: 1 },
-  rating: { rating: -1, reviewCount: -1 },
-  reviews: { reviewCount: -1 },
-  views: { viewCount: -1 },
-  saves: { saveCount: -1 },
+  newest: { createdAt: -1, _id: -1 },
+  oldest: { createdAt: 1, _id: 1 },
+  name: { name: 1, _id: 1 },
+  rating: { rating: -1, reviewCount: -1, _id: -1 },
+  reviews: { reviewCount: -1, _id: -1 },
+  views: { viewCount: -1, _id: -1 },
+  saves: { saveCount: -1, _id: -1 },
 };
 
 /** Filters shared by the list and the export. → { filter, base } (base = without status). */
@@ -693,7 +832,12 @@ const exportRestaurants = asyncHandler(async (req, res) => {
 
 /**
  * Restaurant detail for admins (any status, also deleted) with live stats.
+ * The restaurant document carries followerCount and the rolling `stats` windows.
  * GET /api/admin/restaurants/:id
+ * → { restaurant, stats: { reviews, sentiment, reviewStats, likedPercent, pendingReviews, openReports,
+ *     lists, saves, views, followers, menuItems }, recentReviews (every status), reports }
+ *   (stats.reviewStats = the stored public liked / fine / disliked counts + likedPercent,
+ *   the same numbers as the apps; `sentiment` counts every non-held review.)
  */
 const getRestaurantAdmin = asyncHandler(async (req, res) => {
   const restaurant = await Restaurant.findById(req.params.id)
@@ -736,15 +880,62 @@ const getRestaurantAdmin = asyncHandler(async (req, res) => {
       stats: {
         reviews: sentiment.liked + sentiment.fine + sentiment.disliked,
         sentiment,
+        reviewStats: Object.fromEntries(
+          ["total", "liked", "fine", "disliked", "likedPercent"].map((key) => [key, restaurant.reviewStats?.[key] || 0]),
+        ),
+        likedPercent: restaurant.reviewStats?.likedPercent || 0,
         pendingReviews,
         openReports,
         lists,
         saves: restaurant.saveCount || 0,
         views: restaurant.viewCount || 0,
+        followers: restaurant.followerCount || 0,
         menuItems: restaurant.menuItemCount || 0,
       },
       recentReviews,
       reports,
+    },
+  });
+});
+
+/**
+ * People following a restaurant ("🔔 Follow"), newest first.
+ * GET /api/admin/restaurants/:id/followers?page&limit (≤ 50)
+ * → { followers: [{ _id, firstName, lastName, email, avatar, verified, status, isDeleted, followedAt }],
+ *     pagination }   (rows of deleted accounts are kept as { _id: null, isDeleted: true, followedAt })
+ */
+const listRestaurantFollowers = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = paging(req.query, { limit: 20 });
+  if (!(await Restaurant.exists({ _id: req.params.id }))) throw httpError(404, "Restaurant not found");
+  const filter = { restaurant: req.params.id };
+  const [rows, total] = await Promise.all([
+    RestaurantFollow.find(filter)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate("user", "firstName lastName email avatar verified status isDeleted")
+      .lean(),
+    RestaurantFollow.countDocuments(filter),
+  ]);
+  res.json({
+    success: true,
+    data: {
+      followers: rows.map(({ user: u, createdAt }) =>
+        u
+          ? {
+              _id: u._id,
+              firstName: u.firstName,
+              lastName: u.lastName,
+              email: u.isDeleted ? null : u.email,
+              avatar: u.avatar || null,
+              verified: !!u.verified,
+              status: u.status,
+              isDeleted: !!u.isDeleted,
+              followedAt: createdAt,
+            }
+          : { _id: null, isDeleted: true, followedAt: createdAt },
+      ),
+      pagination: pageInfo(page, limit, total),
     },
   });
 });
@@ -956,6 +1147,9 @@ export {
   listUsers,
   exportUsers,
   getUser,
+  listUserReports,
+  listUserComments,
+  getUserSessions,
   createUser,
   updateUser,
   warnUser,
@@ -969,6 +1163,7 @@ export {
   listAllRestaurants,
   exportRestaurants,
   getRestaurantAdmin,
+  listRestaurantFollowers,
   moderateRestaurant,
   purgeRestaurant,
   setRestaurantStatus,

@@ -1,6 +1,6 @@
 import { config } from "#config";
 import { User } from "#models";
-import { HashService, PlatformService, ModerationService } from "#services";
+import { HashService, PlatformService, ModerationService, AuthTokenService } from "#services";
 
 /**
  * Platform policies applied around routes owned by other modules, so the admin
@@ -9,6 +9,8 @@ import { HashService, PlatformService, ModerationService } from "#services";
  *  - accountStatusGate      POST /api/auth/login — clear 403s for pending /
  *                           suspended / banned accounts (after the password
  *                           check) and auto-lifting of ended suspensions.
+ *                           Mounted after loginRateLimiter (app.js), so its
+ *                           password check is brute-force limited too.
  *  - newAccountPolicy       POST /api/auth/* — a 201 that created an account:
  *                           "New user approval" → the account becomes pending,
  *                           its tokens are revoked and the reply says so;
@@ -119,10 +121,9 @@ const newAccountPolicy = (req, res, next) => {
       set.status = "pending";
       set.statusChangedAt = new Date();
     }
-    if (Object.keys(set).length) {
-      // Approval required: park the account and revoke the tokens just issued.
-      await User.updateOne({ _id: userId }, { $set: set, ...(pending ? { $inc: { tokenVersion: 1 } } : {}) });
-    }
+    if (Object.keys(set).length) await User.updateOne({ _id: userId }, { $set: set });
+    // Approval required: park the account and revoke the tokens just issued.
+    if (pending) await AuthTokenService.revokeAll(userId);
     const updatedUser = { ...user, ...set };
     delete updatedUser.statusChangedAt;
     PlatformService.alertNewUser({ ...updatedUser, _id: userId, status: updatedUser.status || "active" }).catch(

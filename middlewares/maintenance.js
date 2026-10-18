@@ -88,7 +88,7 @@ const maintenanceGate = async (req, res, next) => {
     success: false,
     maintenance: true,
     code: "MAINTENANCE",
-    message: state.message,
+    message: (state.messages?.[req.lang] || "").trim() || state.message,
   });
 };
 

@@ -13,11 +13,22 @@ import {
   RecommendationService,
   SearchHistoryService,
   RestaurantFollowService,
+  ReviewService,
+  OpeningHoursService,
 } from "#services";
 
 // Utils
 import { asyncHandler, escapeRegex, paging, pageInfo } from "#utils";
-import { searchTokens, matchesAll, textScore } from "#utils/search.js";
+import {
+  cleanTranslations,
+  mergeTranslations,
+  allValues,
+  translated,
+  projectTranslations,
+  KIND_LABELS,
+  TRANSLATED_LANGUAGES,
+} from "#utils/translations.js";
+import { searchTokens, matchesAll, textScore, foldText } from "#utils/search.js";
 import { isLat, isLng } from "#utils/geo.js";
 import { derivePriceLevel } from "#utils/pricing.js";
 
@@ -41,6 +52,14 @@ const sortParam = (value) => {
   const key = Q.strParam(value, 40);
   return Q.isSortKey(key) ? key : null;
 };
+
+// Restaurant header of the menu / dishes / photos screens (name localized).
+const header = (restaurant, extra = {}) => ({
+  _id: restaurant._id,
+  name: restaurant.name,
+  ...extra,
+  translations: projectTranslations(restaurant, { name: "name" }),
+});
 
 /** Active restaurant by id or slug (admins may also open pending / closed ones). */
 const findPublicRestaurant = async (idOrSlug, user = null, projection = null) => {
@@ -73,6 +92,7 @@ const listRestaurants = asyncHandler(async (req, res) => {
     sort: sortParam(req.query.sort) || (near ? "distance" : "rating"),
     page,
     limit,
+    lang: req.lang,
   });
 
   res.json({
@@ -114,6 +134,7 @@ const searchRestaurants = asyncHandler(async (req, res) => {
     limit,
     restrictIds: collection?.restrictIds || null,
     rankIds: collection?.rankIds || null,
+    lang: req.lang,
   });
 
   // Friend picks show who picked each place.
@@ -158,38 +179,91 @@ const suggestRestaurants = asyncHandler(async (req, res) => {
     return res.json({ success: true, data: { suggestions: [], groups: empty } });
   }
 
-  const settings = await CatalogService.getSettings();
+  const [settings, visibleItems] = await Promise.all([CatalogService.getSettings(), MenuService.visibleItemFilter()]);
   const near = Q.parseNear(req.query.near);
-  const ctx = Q.context(settings, near);
+  const ctx = Q.context(settings, near, req.lang);
   const tokenMatch = (field) => tokens.map((t) => ({ [field]: { $regex: escapeRegex(t) } }));
+  const byRating = { rating: -1, reviewCount: -1, _id: 1 };
+  const startsWith = `^${escapeRegex(foldText(q))}`;
 
-  const [restaurants, taxonomy, dishRows, cities] = await Promise.all([
+  // Restaurants: names starting with the query, then other name matches, then
+  // address matches — each best rated first — so good hits are never cut off
+  // by an arbitrary limit; the final order is the text ranking below.
+  const restaurantQueries = [
+    Restaurant.find({ ...ACTIVE, "search.name": { $regex: startsWith } }).sort(byRating).limit(10).lean(),
+    Restaurant.find({ ...ACTIVE, $and: tokenMatch("search.name") }).sort(byRating).limit(40).lean(),
     Restaurant.find({
       ...ACTIVE,
       $and: tokens.map((t) => ({
         $or: [{ "search.name": { $regex: escapeRegex(t) } }, { "search.address": { $regex: escapeRegex(t) } }],
       })),
     })
+      .sort(byRating)
       .limit(40)
       .lean(),
-    Taxonomy.find({ type: { $in: ["cuisine", "mood"] }, isActive: true }, "type name image emoji icon").lean(),
+  ];
+
+  const [restaurantLists, taxonomy, dishRows, cities] = await Promise.all([
+    Promise.all(restaurantQueries),
+    Taxonomy.find({ type: { $in: ["cuisine", "mood"] }, isActive: true }, "type name image emoji icon translations").lean(),
+    // Visible dishes of ACTIVE restaurants only (filtered before grouping /
+    // limiting), dishes starting with the query and served widely first.
     MenuItem.aggregate([
-      { $match: { isAvailable: true, $and: tokenMatch("searchKey") } },
+      { $match: { ...visibleItems, $and: tokenMatch("searchKey") } },
+      {
+        $lookup: {
+          from: Restaurant.collection.name,
+          let: { rid: "$restaurant" },
+          pipeline: [
+            { $match: { $expr: { $eq: ["$_id", "$$rid"] }, ...ACTIVE } },
+            { $project: { _id: 1 } },
+          ],
+          as: "activeRestaurant",
+        },
+      },
+      { $match: { "activeRestaurant.0": { $exists: true } } },
       {
         $group: {
           _id: "$searchKey",
           name: { $first: "$name" },
+          translations: { $first: "$translations" },
           image: { $max: "$image" },
           restaurants: { $addToSet: "$restaurant" },
         },
       },
+      {
+        $addFields: {
+          starts: { $cond: [{ $regexMatch: { input: "$_id", regex: startsWith } }, 1, 0] },
+          count: { $size: "$restaurants" },
+        },
+      },
+      { $sort: { starts: -1, count: -1, _id: 1 } },
       { $limit: 40 },
     ]),
-    City.find({ isActive: true }, "name label country latitude longitude").lean(),
+    City.find({ isActive: true }, "name label country latitude longitude translations").lean(),
   ]);
+  const seen = new Set();
+  const restaurants = restaurantLists.flat().filter((r) => {
+    const key = String(r._id);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Names in every language take part in matching / ranking; rows carry
+  // `translations` so the localize middleware shows them in the user's language.
+  const bestScore = (doc, field) => Math.max(0, ...allValues(doc, field).map((v) => textScore(v, q)));
+  const namesOf = (doc) => allValues(doc, "name").join(" ");
+
+  // Address in az / ru: the translated street + the city's translated name.
+  const cityByName = new Map(cities.map((c) => [c.name, c]));
+  const addressIn = (r, lang) =>
+    addressOf({ address: translated(r, "address", lang), city: translated(cityByName.get(r.city), "name", lang) || r.city });
+  const addressTranslations = (r) =>
+    Object.fromEntries(TRANSLATED_LANGUAGES.map((lang) => [lang, addressIn(r, lang)]));
 
   const restaurantRows = restaurants
-    .map((r) => ({ r, score: Math.max(textScore(r.name, q), textScore(addressOf(r), q) / 2) }))
+    .map((r) => ({ r, score: Math.max(bestScore(r, "name"), textScore(addressOf(r), q) / 2) }))
     .sort((a, b) => b.score - a.score || (b.r.rating || 0) - (a.r.rating || 0))
     .slice(0, 6)
     .map(({ r }) => {
@@ -209,14 +283,22 @@ const suggestRestaurants = asyncHandler(async (req, res) => {
         distanceMeters: p.distanceMeters ?? null,
         etaLabel: p.etaLabel ?? null,
         filter: null,
+        translations: projectTranslations(
+          r,
+          { label: "name", value: "name" },
+          address
+            ? { subtitle: addressTranslations(r), address: addressTranslations(r) }
+            : { subtitle: KIND_LABELS.restaurant },
+        ),
       };
     });
 
   const catalogRows = (type, subtitle, max, filterKey) =>
-    Q.rankByText(
-      taxonomy.filter((i) => i.type === type && matchesAll(i.name, tokens)),
-      q,
-    )
+    taxonomy
+      .filter((i) => i.type === type && matchesAll(namesOf(i), tokens))
+      .map((i) => ({ i, score: bestScore(i, "name") }))
+      .sort((a, b) => b.score - a.score)
+      .map(({ i }) => i)
       .slice(0, max)
       .map((i) => ({
         type,
@@ -228,19 +310,11 @@ const suggestRestaurants = asyncHandler(async (req, res) => {
         emoji: i.emoji || null,
         icon: i.icon || null,
         filter: { [filterKey]: i.name },
+        translations: projectTranslations(i, { label: "name", value: "name" }, { subtitle: KIND_LABELS[type] }),
       }));
 
-  // Dishes served by at least one active restaurant.
-  const dishRestaurantIds = [...new Set(dishRows.flatMap((d) => d.restaurants.map(String)))];
-  const activeIds = new Set(
-    (await Restaurant.find({ _id: { $in: dishRestaurantIds }, ...ACTIVE }, "_id").lean()).map((r) => String(r._id)),
-  );
-  const dishSuggestions = Q.rankByText(
-    dishRows
-      .map((d) => ({ ...d, count: d.restaurants.filter((id) => activeIds.has(String(id))).length }))
-      .filter((d) => d.count > 0),
-    q,
-  )
+  // Dishes served by at least one active restaurant (filtered in the pipeline).
+  const dishSuggestions = Q.rankByText(dishRows, q)
     .slice(0, 4)
     .map((d) => ({
       type: "dish",
@@ -251,12 +325,14 @@ const suggestRestaurants = asyncHandler(async (req, res) => {
       image: d.image || null,
       restaurantCount: d.count,
       filter: { dish: d.name },
+      translations: projectTranslations(d, { label: "name", value: "name" }, { subtitle: KIND_LABELS.dish }),
     }));
 
-  const placeRows = Q.rankByText(
-    cities.filter((c) => matchesAll(c.name, tokens)),
-    q,
-  )
+  const placeRows = cities
+    .filter((c) => matchesAll(`${namesOf(c)} ${allValues(c, "label").join(" ")}`, tokens))
+    .map((c) => ({ c, score: bestScore(c, "name") }))
+    .sort((a, b) => b.score - a.score)
+    .map(({ c }) => c)
     .slice(0, 3)
     .map((c) => ({
       type: "place",
@@ -267,6 +343,7 @@ const suggestRestaurants = asyncHandler(async (req, res) => {
       latitude: c.latitude,
       longitude: c.longitude,
       filter: { city: c.name, near: `${c.longitude},${c.latitude}` },
+      translations: projectTranslations(c, { label: "name", value: "name", subtitle: "label" }),
     }));
 
   const groups = {
@@ -306,6 +383,7 @@ const getLandingSuggestions = asyncHandler(async (req, res) => {
     area,
     near,
     limit,
+    lang: req.lang,
   });
   res.json({ success: true, data: { suggestions } });
 });
@@ -342,7 +420,7 @@ const getHomeFeed = asyncHandler(async (req, res) => {
 
   const near = Q.parseNear(req.query.near);
   const area = await Q.resolveArea({ near, city: Q.strParam(req.query.city, 80) }, settings);
-  const ctx = Q.context(settings, near);
+  const ctx = Q.context(settings, near, req.lang);
   const scoped = { ...ACTIVE, ...area.filter };
   const present = (list) => list.map((r) => Q.present(r, ctx));
   const limitOf = (key) => section(key)?.limit || 10;
@@ -368,10 +446,10 @@ const getHomeFeed = asyncHandler(async (req, res) => {
   const recentQuery = () => {
     const limit = limitOf("recentlyViewed");
     if (req.user) {
-      return RecommendationService.recentlyViewed(req.user._id, { limit, settings, near });
+      return RecommendationService.recentlyViewed(req.user._id, { limit, settings, near, lang: req.lang });
     }
     const ids = Q.listParam(req.query.recentIds).filter(Q.isObjectId);
-    return RecommendationService.inOrder(ids, { limit, settings, near });
+    return RecommendationService.inOrder(ids, { limit, settings, near, lang: req.lang });
   };
 
   const [cuisines, nearYou, discounted, recentlyViewed, recommends, topViewed, topSaved] =
@@ -408,9 +486,16 @@ const getHomeFeed = asyncHandler(async (req, res) => {
 
   // "Up to {maxDiscount}% off" → the real best discount (list is sorted desc).
   const maxDiscount = discounted[0]?.discountPercent || 0;
+  const withDiscount = (text) => String(text ?? "").replace(/\{maxDiscount\}/g, String(maxDiscount));
   const resolved = sections.map((s) => ({
     ...s,
-    title: s.title.replace(/\{maxDiscount\}/g, String(maxDiscount)),
+    title: withDiscount(s.title),
+    translations: Object.fromEntries(
+      Object.entries(s.translations || {}).map(([lang, entry]) => [
+        lang,
+        entry?.title ? { ...entry, title: withDiscount(entry.title) } : entry,
+      ]),
+    ),
   }));
 
   res.json({
@@ -452,6 +537,7 @@ const getCuisines = asyncHandler(async (req, res) => {
 const surpriseRestaurant = asyncHandler(async (req, res) => {
   const settings = await CatalogService.getSettings();
   const { match, expr } = await Q.buildFilter(req.query, { settings });
+  await OpeningHoursService.ensureFresh();
   match.openNow = true;
 
   const near = Q.parseNear(req.query.near);
@@ -485,7 +571,7 @@ const surpriseRestaurant = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: {
-      restaurant: pick ? Q.present(pick, Q.context(settings, near)) : null,
+      restaurant: pick ? Q.present(pick, Q.context(settings, near, req.lang)) : null,
       basedOnPreferences,
     },
   });
@@ -506,6 +592,7 @@ const getRecentlyViewed = asyncHandler(async (req, res) => {
     limit,
     settings,
     near: Q.parseNear(req.query.near),
+    lang: req.lang,
   });
   res.json({ success: true, data: { restaurants } });
 });
@@ -584,7 +671,10 @@ const getRestaurant = asyncHandler(async (req, res) => {
     req.user ? RestaurantFollowService.isFollowing(req.user._id, restaurant._id) : false,
     restaurant.status === "active" ? RestaurantStatsService.recordView(req, restaurant._id) : null,
   ]);
-  const payload = Q.present(restaurant, Q.context(settings, Q.parseNear(req.query.near)), { detail: true });
+  const payload = Q.present(restaurant, Q.context(settings, Q.parseNear(req.query.near), req.lang), {
+    detail: true,
+    admin: req.user?.role === "admin",
+  });
   // Signed-in viewers: the "🔔 Follow" state (followerCount is a stored field).
   if (req.user) payload.isFollowing = isFollowing;
 
@@ -597,13 +687,13 @@ const getRestaurant = asyncHandler(async (req, res) => {
  * GET /api/restaurants/:id/menu
  */
 const getRestaurantMenu = asyncHandler(async (req, res) => {
-  const restaurant = await findPublicRestaurant(req.params.id, req.user, "name slug menuPhotos");
+  const restaurant = await findPublicRestaurant(req.params.id, req.user, "name slug menuPhotos translations");
   if (!restaurant) return notFound(res);
   const menu = await MenuService.menuOf(restaurant._id);
   res.json({
     success: true,
     data: {
-      restaurant: { _id: restaurant._id, name: restaurant.name, slug: restaurant.slug },
+      restaurant: header(restaurant, { slug: restaurant.slug }),
       ...menu,
       menuPhotoCount: restaurant.menuPhotos?.length || 0,
     },
@@ -616,9 +706,10 @@ const getRestaurantMenu = asyncHandler(async (req, res) => {
  * GET /api/restaurants/:id/dishes?q=&popular=true
  */
 const getRestaurantDishes = asyncHandler(async (req, res) => {
-  const restaurant = await findPublicRestaurant(req.params.id, req.user, "name");
+  const restaurant = await findPublicRestaurant(req.params.id, req.user, "name translations");
   if (!restaurant) return notFound(res);
-  const filter = { restaurant: restaurant._id, isAvailable: true };
+  // Items of hidden categories stay hidden (as in the full menu).
+  const filter = await MenuService.visibleItemFilter({ restaurant: restaurant._id });
   if (Q.boolParam(req.query.popular)) filter.isPopular = true;
   const tokens = searchTokens(Q.strParam(req.query.q, 100));
   if (tokens.length) filter.$and = tokens.map((t) => ({ searchKey: { $regex: escapeRegex(t) } }));
@@ -626,7 +717,7 @@ const getRestaurantDishes = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: {
-      restaurant: { _id: restaurant._id, name: restaurant.name },
+      restaurant: header(restaurant),
       dishes: items.map(MenuService.toItem),
     },
   });
@@ -637,12 +728,12 @@ const getRestaurantDishes = asyncHandler(async (req, res) => {
  * GET /api/restaurants/:id/menu-photos
  */
 const getMenuPhotos = asyncHandler(async (req, res) => {
-  const restaurant = await findPublicRestaurant(req.params.id, req.user, "name menuPhotos");
+  const restaurant = await findPublicRestaurant(req.params.id, req.user, "name menuPhotos translations");
   if (!restaurant) return notFound(res);
   res.json({
     success: true,
     data: {
-      restaurant: { _id: restaurant._id, name: restaurant.name },
+      restaurant: header(restaurant),
       photos: restaurant.menuPhotos || [],
     },
   });
@@ -650,24 +741,25 @@ const getMenuPhotos = asyncHandler(async (req, res) => {
 
 /**
  * Restaurant photos: the cover gallery + photos from members' published
- * reviews ("Photos from members"), newest first, paginated by photo.
- * Stealth reviews show no author.
+ * reviews ("Photos from members"), newest first, paginated by photo. Only
+ * public reviews (approved, author active — ReviewService.publicFilter); the
+ * author is hidden exactly as on the review itself (stealth reviews, the
+ * author's reviewsVisibility / private account — ReviewService.toPublic).
  * GET /api/restaurants/:id/photos?page=1&limit=20
  */
+// Author fields the review visibility rules look at.
+const PHOTO_AUTHOR_PROJECTION = Object.fromEntries(
+  [...ReviewService.AUTHOR_FIELDS.split(/\s+/), "isPrivate", "isDeleted", "status"].filter(Boolean).map((f) => [f, 1]),
+);
+
 const getRestaurantPhotos = asyncHandler(async (req, res) => {
-  const restaurant = await findPublicRestaurant(req.params.id, req.user, "name coverImages");
+  const restaurant = await findPublicRestaurant(req.params.id, req.user, "name coverImages translations");
   if (!restaurant) return notFound(res);
   const { page, limit, skip } = paging(req.query, { limit: 20, max: 50 });
 
+  const visible = await ReviewService.publicFilter({ restaurant: restaurant._id });
   const [result] = await Review.aggregate([
-    {
-      $match: {
-        restaurant: restaurant._id,
-        isDeleted: false,
-        status: { $in: ["approved", null] },
-        "photos.0": { $exists: true },
-      },
-    },
+    { $match: { ...visible, "photos.0": { $exists: true } } },
     { $sort: { createdAt: -1 } },
     { $unwind: { path: "$photos", includeArrayIndex: "photoIndex" } },
     {
@@ -681,7 +773,7 @@ const getRestaurantPhotos = asyncHandler(async (req, res) => {
               localField: "user",
               foreignField: "_id",
               as: "author",
-              pipeline: [{ $project: { firstName: 1, lastName: 1, avatar: 1, isDeleted: 1 } }],
+              pipeline: [{ $project: PHOTO_AUTHOR_PROJECTION }],
             },
           },
         ],
@@ -692,15 +784,15 @@ const getRestaurantPhotos = asyncHandler(async (req, res) => {
 
   const members = (result?.items || []).map((row) => {
     const author = row.author?.[0];
-    const hidden = row.isStealth || !author || author.isDeleted;
+    // Same author masking as the review card (one photo per row here).
+    const shown = author && !author.isDeleted ? ReviewService.toPublic({ ...row, user: author }, req.user) : null;
+    const user = shown && !shown.isAnonymous ? shown.user : null;
     return {
       photo: row.photos,
       review: row._id,
       sentiment: row.sentiment,
       dishes: (row.favoriteDishes || []).map((d) => d.name).filter(Boolean),
-      user: hidden
-        ? null
-        : { _id: author._id, firstName: author.firstName, lastName: author.lastName, avatar: author.avatar ?? null },
+      user: user ? { _id: user._id, firstName: user.firstName, lastName: user.lastName, avatar: user.avatar ?? null } : null,
       createdAt: row.createdAt,
     };
   });
@@ -708,7 +800,7 @@ const getRestaurantPhotos = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: {
-      restaurant: { _id: restaurant._id, name: restaurant.name },
+      restaurant: header(restaurant),
       cover: restaurant.coverImages || [],
       members,
       pagination: pageInfo(page, limit, result?.total?.[0]?.n || 0),
@@ -868,6 +960,14 @@ const pickEditable = async (body, existing = null) => {
     return { error: "priceMax must be greater than or equal to priceMin" };
   }
 
+  // az / ru name, description and address (every text optional).
+  const translations = cleanTranslations(body.translations, ["name", "description", "address"], { maxLength: 5000 });
+  if (translations.error) return { error: translations.error };
+  if (translations.value !== undefined) {
+    const current = existing?.translations?.toObject ? existing.translations.toObject() : existing?.translations;
+    fields.translations = mergeTranslations(current, translations.value);
+  }
+
   // Legacy admin form: popularDishes → menu items.
   let dishes = null;
   if (body.popularDishes !== undefined) {
@@ -915,12 +1015,13 @@ const createRestaurant = asyncHandler(async (req, res) => {
   applyPriceLevel(restaurant, settings);
   await restaurant.save();
   if (dishes?.length) await MenuService.applyLegacyPopularDishes(restaurant._id, dishes);
+  CatalogService.invalidateCounts();
 
   const created = await Restaurant.findById(restaurant._id);
   res.status(201).json({
     success: true,
     message: "Restaurant created",
-    data: { restaurant: Q.present(created, Q.context(settings), { detail: true }) },
+    data: { restaurant: Q.present(created, Q.context(settings), { detail: true, admin: true }) },
   });
 });
 
@@ -945,6 +1046,7 @@ const updateRestaurant = asyncHandler(async (req, res) => {
   applyPriceLevel(restaurant, settings);
   await restaurant.save();
   if (dishes) await MenuService.applyLegacyPopularDishes(restaurant._id, dishes);
+  CatalogService.invalidateCounts();
   // A new discount → tell the restaurant's followers (fire-and-forget).
   if (!hadDiscount && (restaurant.discountPercent || 0) > 0) {
     RestaurantFollowService.notifyFollowers(restaurant._id, "offer", { discountPercent: restaurant.discountPercent });
@@ -960,7 +1062,7 @@ const updateRestaurant = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     message: "Restaurant updated",
-    data: { restaurant: Q.present(updated, Q.context(settings), { detail: true }) },
+    data: { restaurant: Q.present(updated, Q.context(settings), { detail: true, admin: true }) },
   });
 });
 
@@ -975,6 +1077,7 @@ const deleteRestaurant = asyncHandler(async (req, res) => {
 
   restaurant.isDeleted = true;
   await restaurant.save();
+  CatalogService.invalidateCounts();
 
   res.json({ success: true, message: "Restaurant deleted" });
 });
@@ -1002,4 +1105,8 @@ export {
   createRestaurant,
   updateRestaurant,
   deleteRestaurant,
+  // Shared with the bulk JSON import (adminImportController).
+  EDITABLE_FIELDS,
+  pickEditable,
+  applyPriceLevel,
 };

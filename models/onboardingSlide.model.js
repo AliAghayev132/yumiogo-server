@@ -1,4 +1,5 @@
 import { Schema, Model } from "#constants";
+import { translationsField } from "#utils/translations.js";
 
 /**
  * OnboardingSlide — one page of the mobile first-launch carousel.
@@ -22,6 +23,7 @@ const onboardingSlideSchema = new Schema(
     image: { type: String, default: null },
     order: { type: Number, default: 0 },
     isActive: { type: Boolean, default: true },
+    translations: translationsField(["title", "subtitle"]),
   },
   {
     timestamps: true,

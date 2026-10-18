@@ -6,8 +6,10 @@ import {
   adminReportController as adminReport,
   adminMenuController as menu,
   adminListController as adminList,
+  adminTranslateController as translate,
+  adminImportController as restaurantImport,
 } from "#controllers";
-import { authenticate, requireRole, writeRateLimiter, validateObjectId } from "#middlewares";
+import { authenticate, requireRole, writeRateLimiter, translateRateLimiter, validateObjectId } from "#middlewares";
 
 const AdminRouter = Router();
 
@@ -28,6 +30,10 @@ AdminRouter.post("/notifications/broadcast", writeRateLimiter, adminController.b
 AdminRouter.get("/meta", adminController.getMeta);
 AdminRouter.get("/settings", adminController.getSettings);
 AdminRouter.put("/settings", writeRateLimiter, adminController.updateSettings);
+
+// AI translation of admin content (OpenRouter; 503 TRANSLATE_NOT_CONFIGURED without a key)
+AdminRouter.get("/translate/status", translate.getTranslateStatus);
+AdminRouter.post("/translate", translateRateLimiter, translate.translate);
 
 // Catalog — taxonomies (cuisines, features, tags, dietary, moods, report reasons)
 // "/reorder" is declared before "/:id" routes.
@@ -70,6 +76,9 @@ AdminRouter.get("/users", adminController.listUsers);
 AdminRouter.post("/users", writeRateLimiter, adminController.createUser);
 AdminRouter.get("/users/export", adminController.exportUsers);
 AdminRouter.get("/users/:id", userId, adminController.getUser);
+AdminRouter.get("/users/:id/reports", userId, adminController.listUserReports);
+AdminRouter.get("/users/:id/comments", userId, adminController.listUserComments);
+AdminRouter.get("/users/:id/sessions", userId, adminController.getUserSessions);
 AdminRouter.patch("/users/:id", userId, writeRateLimiter, adminController.updateUser);
 AdminRouter.post("/users/:id/warn", userId, writeRateLimiter, adminController.warnUser);
 AdminRouter.delete(
@@ -89,7 +98,11 @@ AdminRouter.delete("/users/:id", userId, writeRateLimiter, adminController.delet
 const restaurantId = validateObjectId("id");
 AdminRouter.get("/restaurants", adminController.listAllRestaurants);
 AdminRouter.get("/restaurants/export", adminController.exportRestaurants);
+// Bulk JSON import (dryRun validates only) — before "/restaurants/:id".
+AdminRouter.get("/restaurants/import/template", restaurantImport.getImportTemplate);
+AdminRouter.post("/restaurants/import", writeRateLimiter, restaurantImport.importRestaurants);
 AdminRouter.get("/restaurants/:id", restaurantId, adminController.getRestaurantAdmin);
+AdminRouter.get("/restaurants/:id/followers", restaurantId, adminController.listRestaurantFollowers);
 AdminRouter.post("/restaurants/:id/approve", restaurantId, writeRateLimiter, adminController.moderateRestaurant("approve"));
 AdminRouter.post("/restaurants/:id/reject", restaurantId, writeRateLimiter, adminController.moderateRestaurant("reject"));
 AdminRouter.post("/restaurants/:id/suspend", restaurantId, writeRateLimiter, adminController.moderateRestaurant("suspend"));

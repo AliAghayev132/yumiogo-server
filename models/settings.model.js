@@ -12,6 +12,7 @@ import {
 } from "#constants";
 import { DEFAULT_SETTINGS } from "#constants/shared/catalogDefaults.js";
 import { isValidTimezone } from "#utils/openingHours.js";
+import { translationsField } from "#utils/translations.js";
 
 /**
  * Settings — a single app-configuration document (admin panel Settings page).
@@ -35,6 +36,7 @@ const sortOptionSchema = new Schema(
     description: { type: String, default: "", trim: true },
     isActive: { type: Boolean, default: true },
     order: { type: Number, default: 0 },
+    translations: translationsField(["label", "description"]),
   },
   { _id: false },
 );
@@ -47,6 +49,7 @@ const trendingOptionSchema = new Schema(
     description: { type: String, default: "", trim: true },
     isActive: { type: Boolean, default: true },
     order: { type: Number, default: 0 },
+    translations: translationsField(["label", "description"]),
   },
   { _id: false },
 );
@@ -61,6 +64,7 @@ const recommendationSchema = new Schema(
     image: { type: String, default: null },
     isActive: { type: Boolean, default: true },
     order: { type: Number, default: 0 },
+    translations: translationsField(["title", "description"]),
   },
   { _id: false },
 );
@@ -72,6 +76,7 @@ const priceLevelSchema = new Schema(
     hint: { type: String, default: "", trim: true },
     // Exclusive upper bound (₼) of the average-price band; null = no bound.
     maxPrice: { type: Number, default: null, min: 0 },
+    translations: translationsField(["label", "hint"]),
   },
   { _id: false },
 );
@@ -81,6 +86,7 @@ const notificationOptionSchema = new Schema(
     key: { type: String, enum: NOTIFICATION_OPTION_KEYS, required: true },
     label: { type: String, default: "", trim: true },
     description: { type: String, default: "", trim: true },
+    translations: translationsField(["label", "description"]),
   },
   { _id: false },
 );
@@ -91,6 +97,7 @@ const sentimentSchema = new Schema(
     label: { type: String, default: "", trim: true },
     emoji: { type: String, default: "" },
     color: { type: String, default: null },
+    translations: translationsField(["label"]),
   },
   { _id: false },
 );
@@ -105,11 +112,16 @@ const homeSectionSchema = new Schema(
     limit: { type: Number, default: 10, min: 1, max: 50 },
     isActive: { type: Boolean, default: true },
     order: { type: Number, default: 0 },
+    translations: translationsField(["title", "subtitle", "ctaLabel", "tabLabels"], { arrays: ["tabLabels"] }),
   },
   { _id: false },
 );
 
 const { filters, quickFilters, surprise, eta } = DEFAULT_SETTINGS;
+
+// Free-text settings with az / ru versions.
+export const SETTINGS_TRANSLATED = ["maintenanceMessage", "supportReplyNote", "companyAddress"];
+export const SURPRISE_FIELDS = Object.keys(surprise);
 
 const settingsSchema = new Schema(
   {
@@ -146,6 +158,8 @@ const settingsSchema = new Schema(
     supportPhone: { type: String, default: DEFAULT_SETTINGS.supportPhone },
     companyAddress: { type: String, default: DEFAULT_SETTINGS.companyAddress },
     supportReplyNote: { type: String, default: DEFAULT_SETTINGS.supportReplyNote },
+    // az / ru texts of maintenanceMessage / supportReplyNote / companyAddress.
+    translations: translationsField(SETTINGS_TRANSLATED),
     // IANA zone used to derive Restaurant.openNow from opening hours.
     timezone: {
       type: String,
@@ -165,6 +179,8 @@ const settingsSchema = new Schema(
       maxRadius: { type: Number, default: filters.maxRadius, min: 0 },
       // metres (as a string key) → display label, e.g. { "1500": "1 mile" }.
       distanceLabels: { type: Schema.Types.Mixed, default: () => ({}) },
+      // { az: { distanceLabels: { "1500": "…" } }, ru: { … } }
+      translations: { type: Schema.Types.Mixed, default: () => ({}) },
     },
     // Card travel time: distance × roadFactor at speedKmh.
     eta: {
@@ -202,6 +218,7 @@ const settingsSchema = new Schema(
       againCta: { type: String, default: surprise.againCta },
       exploreCta: { type: String, default: surprise.exploreCta },
       preferencesNote: { type: String, default: surprise.preferencesNote },
+      translations: translationsField(SURPRISE_FIELDS),
     },
 
     // ----- App store listings (https URLs; "" = not published yet) -----
@@ -218,6 +235,16 @@ const settingsSchema = new Schema(
     },
     // Feed "Invite friends 0/3": how many friends the invite goal asks for.
     inviteGoal: { type: Number, default: DEFAULT_SETTINGS.inviteGoal, min: 1, max: 20 },
+    // Liked-percentage rating: "92% liked" shows from this many public reviews;
+    // also the threshold of the "best rated" sort (RestaurantQueryService).
+    ratingDisplay: {
+      minReviewsForPercent: {
+        type: Number,
+        default: DEFAULT_SETTINGS.ratingDisplay.minReviewsForPercent,
+        min: 1,
+        max: 100,
+      },
+    },
 
     // Internal: "<type>:<slug>" keys of catalog defaults already inserted once,
     // so an item the admin deleted is not re-created on the next boot.

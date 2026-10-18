@@ -1,5 +1,5 @@
 import { APP_LANGUAGES } from "#constants";
-import { ERROR_MESSAGES, EMAIL_COPY } from "./messages.js";
+import { ERROR_MESSAGES, EMAIL_COPY, NOTIFICATION_COPY } from "./messages.js";
 
 /**
  * Server-side i18n (en / az / ru).
@@ -10,6 +10,9 @@ import { ERROR_MESSAGES, EMAIL_COPY } from "./messages.js";
  *    `message` in `lang` (the code itself never changes — clients keep
  *    switching on it). English responses are left untouched.
  *  - emailCopy(lang): the e-mail strings for a language (falls back to en).
+ *  - notificationCopy(lang) / systemNotificationText(ref, lang): the
+ *    notification sentences, and a moderation notice rendered from its
+ *    stored copy key (Notification data.i18n).
  *
  * The `localize` middleware applies localizeBody to every res.json() when the
  * request's Accept-Language asks for az or ru.
@@ -59,6 +62,53 @@ const emailCopy = (lang) => EMAIL_COPY[normalizeLanguage(lang)] || EMAIL_COPY.en
 const fill = (text, values = {}) =>
   String(text ?? "").replace(/\{(\w+)\}/g, (match, key) => (values[key] !== undefined ? String(values[key]) : ""));
 
+/** Notification copy for `lang` (English when unknown). */
+const notificationCopy = (lang) => NOTIFICATION_COPY[normalizeLanguage(lang)] || NOTIFICATION_COPY.en;
+
+const DATE_LOCALES = { en: "en-GB", az: "az-Latn-AZ", ru: "ru-RU" };
+const formatDate = (value, lang) => {
+  const d = value ? new Date(value) : null;
+  if (!d || Number.isNaN(d.getTime())) return "";
+  const locale = normalizeLanguage(lang);
+  // "2 ноября 2026 г." → no trailing dot (the sentence adds its own).
+  return d
+    .toLocaleDateString(DATE_LOCALES[locale], {
+      day: "numeric",
+      month: locale === "en" ? "short" : "long",
+      year: "numeric",
+    })
+    .replace(/\.$/, "");
+};
+
+/**
+ * { title, message } of a moderation notice stored with a copy key
+ * (`ref` = Notification data.i18n = { key, values }) in `lang`; null when the
+ * key is unknown. `overrides` replace values (e.g. the restaurant name in
+ * `lang`); restaurant / about names are quoted per language, `until` is a date.
+ */
+const systemNotificationText = (ref, lang, overrides = {}) => {
+  const copy = notificationCopy(lang);
+  const entry = ref && typeof ref === "object" ? copy.system[ref.key] : null;
+  if (!entry) return null;
+  const values = { ...(ref.values && typeof ref.values === "object" ? ref.values : {}) };
+  Object.entries(overrides).forEach(([key, value]) => {
+    if (value) values[key] = value;
+  });
+  const quote = (name) => fill(copy.quote, { name });
+  const filled = {
+    ...values,
+    restaurant: values.restaurant ? quote(values.restaurant) : copy.someRestaurant,
+    about: values.about ? quote(values.about) : copy.targets[values.targetType] || copy.targets.review,
+    until: formatDate(values.until, lang),
+  };
+  let message = fill(filled.until && entry.messageUntil ? entry.messageUntil : entry.message, filled);
+  if (values.reason && entry.reason) message += fill(entry.reason, filled);
+  if (values.note && entry.note) message += fill(entry.note, filled);
+  // A sentence that starts with a fallback noun ("siyahı ilə bağlı…").
+  message = message.charAt(0).toLocaleUpperCase(normalizeLanguage(lang)) + message.slice(1);
+  return { title: entry.title, message };
+};
+
 export {
   SUPPORTED as SUPPORTED_LANGUAGES,
   DEFAULT_LANGUAGE,
@@ -68,4 +118,6 @@ export {
   localizeBody,
   emailCopy,
   fill,
+  notificationCopy,
+  systemNotificationText,
 };

@@ -230,13 +230,6 @@ const getReport = asyncHandler(async (req, res) => {
 });
 
 // What the reporter is told when the report is closed.
-const reporterMessage = (report, status, note) => {
-  const about = report.targetLabel || `a ${report.targetType}`;
-  const suffix = note ? ` Note from our team: ${note}` : "";
-  return status === "resolved"
-    ? `Your report about ${about} was reviewed and action was taken.${suffix}`
-    : `Your report about ${about} was reviewed. No action was taken.${suffix}`;
-};
 
 /**
  * Change a report's status. Resolving can enforce on a reported review
@@ -284,26 +277,28 @@ const updateReport = asyncHandler(async (req, res) => {
   if (action !== "none" && action !== "remove_list") {
     const review = await Review.findOne({ _id: report.targetId, isDeleted: false }).populate("restaurant", "name");
     if (!review) return badRequest(res, "The reported review no longer exists");
-    const place = review.restaurant?.name || "a restaurant";
+    const place = review.restaurant?.name || "";
     const reason = note || report.reason;
     if (action === "hide_review") {
-      await ReviewService.setStatus(review, "rejected", { by: req.user._id, note: reason });
-      await ReviewService.notify({
-        recipient: review.user,
-        type: "system",
-        title: "Review hidden",
-        message: `Your review of ${place} was hidden. Reason: ${reason}`,
-        review: review._id,
-        restaurant: review.restaurant,
-        data: { reviewStatus: "rejected" },
-      });
+      // Already hidden: settle the reports, but don't re-notify the author.
+      if (review.status !== "rejected") {
+        await ReviewService.setStatus(review, "rejected", { by: req.user._id, note: reason });
+        await ReviewService.notify({
+          recipient: review.user,
+          type: "system",
+          copy: { key: "review_hidden", values: { restaurant: place, reason } },
+          review: review._id,
+          restaurant: review.restaurant,
+          data: { reviewStatus: "rejected" },
+        });
+      }
     } else {
-      await ReviewService.removeReview(review, { by: req.user._id, reason, byAdmin: false });
+      // An admin removal (moderatedBy / note recorded); the reports are closed below.
+      await ReviewService.removeReview(review, { by: req.user._id, reason, byAdmin: true, closeReports: false });
       await ReviewService.notify({
         recipient: review.user,
         type: "system",
-        title: "Review removed",
-        message: `Your review of ${place} was removed. Reason: ${reason}`,
+        copy: { key: "review_removed", values: { restaurant: place, reason } },
         restaurant: review.restaurant,
         data: { reviewStatus: "deleted" },
       });
@@ -328,8 +323,10 @@ const updateReport = asyncHandler(async (req, res) => {
     await ReviewService.notify({
       recipient: report.reporter,
       type: "system",
-      title: "Report reviewed",
-      message: reporterMessage(report, status, note),
+      copy: {
+        key: status === "resolved" ? "report_resolved" : "report_dismissed",
+        values: { about: report.targetLabel || "", targetType: report.targetType, note },
+      },
       data: { reportId: String(report._id), reportStatus: status },
     });
   }

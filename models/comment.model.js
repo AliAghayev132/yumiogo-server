@@ -79,5 +79,7 @@ const commentSchema = new Schema(
 
 commentSchema.index({ review: 1, parent: 1, createdAt: 1 });
 commentSchema.index({ parent: 1, createdAt: 1 });
+// A user's comments (counter recount when their account is blocked / restored).
+commentSchema.index({ user: 1 });
 
 export const Comment = Model("Comment", commentSchema);

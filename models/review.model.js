@@ -1,4 +1,5 @@
 import { Schema, Model, reviewReactions, reviewStatuses } from "#constants";
+import { translationsField } from "#utils/translations.js";
 import { Counter } from "./counter.model.js";
 
 /**
@@ -9,12 +10,17 @@ import { Counter } from "./counter.model.js";
  * (liked=5, fine=3, disliked=1). Restaurant.rating / reviewCount are recomputed
  * from APPROVED, non-deleted reviews by ReviewService.recomputeRestaurant().
  *
- * One live review per user per restaurant; after deleting it the user can
- * write a new one (the deleted one stays for moderation history).
+ * A user may review the same restaurant more than once (separate visits):
+ * POST /api/reviews always creates a new review (at most one new review per
+ * user per restaurant per REVIEW_COOLDOWN_MS — see ReviewService.newReviewCooldown),
+ * PUT /api/reviews/:id edits one. Deleted reviews stay for moderation history.
  */
 
 // sentiment → numeric score for rating aggregation
 export const SENTIMENT_SCORE = { liked: 5, fine: 3, disliked: 1 };
+
+// Anti-spam: one NEW review per user per restaurant per 24 h (edits are not limited).
+export const REVIEW_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 // Composer limits (Figma "Review & photos": 0 / 500).
 export const REVIEW_LIMITS = {
@@ -26,10 +32,13 @@ export const REVIEW_LIMITS = {
 };
 
 // A dish the reviewer loved: free text name, optionally linked to a menu item.
+// Linked dishes store the menu item's canonical English name plus copies of its
+// az / ru names (`translations`), so the dish is shown in the reader's language.
 const favoriteDishSchema = new Schema(
   {
-    name: { type: String, required: true, trim: true, maxlength: 80 },
+    name: { type: String, required: true, trim: true, maxlength: 120 },
     menuItem: { type: Schema.Types.ObjectId, default: null },
+    translations: translationsField(["name"], { maxlength: 120 }),
   },
   { _id: false },
 );
@@ -122,6 +131,12 @@ const reviewSchema = new Schema(
       type: Date,
       default: null,
     },
+    // Last content edit by the author (an edit of a rejected / flagged review
+    // keeps that status — the admin sees it was edited after moderation).
+    editedAt: {
+      type: Date,
+      default: null,
+    },
 
     // ----- Reactions -----
     likes: {
@@ -170,21 +185,23 @@ const reviewSchema = new Schema(
   },
 );
 
-// One LIVE review per user per restaurant — a soft-deleted review does not block
-// a new one (ReviewService.bootstrap() replaces the old full unique index).
-reviewSchema.index(
-  { restaurant: 1, user: 1 },
-  { unique: true, partialFilterExpression: { isDeleted: false }, name: "restaurant_user_live_unique" },
-);
+// A user's reviews of one restaurant, newest first (myReviews, the 24 h
+// cooldown, moderation history). NOT unique: several reviews per place are
+// allowed — ReviewService.bootstrap() drops the old unique (restaurant, user) index.
+reviewSchema.index({ restaurant: 1, user: 1, createdAt: -1 });
 reviewSchema.index({ restaurant: 1, createdAt: -1 });
 reviewSchema.index({ restaurant: 1, status: 1, isDeleted: 1, createdAt: -1 });
 reviewSchema.index({ user: 1, isDeleted: 1, createdAt: -1 });
 reviewSchema.index({ status: 1, createdAt: -1 });
+// Photo reference lookups (photo clean-up / orphan sweep).
+reviewSchema.index({ photos: 1 });
 
 // Keep `score` in sync with `sentiment`; number new reviews.
 reviewSchema.pre("save", async function () {
   this.score = SENTIMENT_SCORE[this.sentiment] ?? 3;
-  this.likeCount = this.likes.length;
+  // likeCount is maintained atomically (and excludes hidden authors, see
+  // ReviewService.recountActivityOf) — only derive it when `likes` was set here.
+  if (this.isNew || this.isModified("likes")) this.likeCount = this.likes.length;
   if (this.isNew && !this.number) this.number = await Counter.next("review");
 });
 

@@ -24,3 +24,5 @@ export { UploadSweepService } from "./UploadSweepService.js";
 export { RestaurantFollowService } from "./RestaurantFollowService.js";
 export { LinkPreviewService } from "./LinkPreviewService.js";
 export { DataWipeService } from "./DataWipeService.js";
+export { FollowRequestService } from "./FollowRequestService.js";
+export { TranslationService } from "./TranslationService.js";

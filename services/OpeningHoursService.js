@@ -6,13 +6,17 @@ import { computeOpenNow, setTimezone, getTimezone } from "#utils";
  * the clock. The pre-save hook covers edits; this refreshes every restaurant at
  * boot and then every few minutes, so "Open now" filters stay correct as
  * opening/closing times pass. The same tick ends promotions whose
- * discountEndsAt has passed.
+ * discountEndsAt has passed. An "Open now" search first calls ensureFresh(),
+ * which re-runs the refresh when the last one is older than a minute.
  */
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const FRESH_MS = 60 * 1000; // max age of the flags for an "Open now" filter
 
 class OpeningHoursService {
   static timer = null;
+  static lastRefreshAt = 0;
+  static running = null;
 
   /** Load Settings.timezone into the cache used by the pre-save hook. */
   static async loadTimezone() {
@@ -22,12 +26,30 @@ class OpeningHoursService {
   }
 
   /** Recompute openNow for every restaurant; writes only the changed ones. */
-  static async refreshAll() {
+  static refreshAll() {
+    const pass = this.runRefresh().finally(() => {
+      if (this.running === pass) this.running = null;
+    });
+    this.running = pass;
+    return pass;
+  }
+
+  /**
+   * refreshAll() when the last pass is older than `maxAgeMs` (else a no-op);
+   * joins a pass that is already running.
+   */
+  static async ensureFresh(maxAgeMs = FRESH_MS) {
+    if (Date.now() - this.lastRefreshAt < maxAgeMs) return 0;
+    return this.running || this.refreshAll();
+  }
+
+  static async runRefresh() {
     await this.loadTimezone();
+    const startedAt = Date.now();
 
     const restaurants = await Restaurant.find(
       { isDeleted: false },
-      "hours temporarilyClosed openNow",
+      "hours temporarilyClosed openNow updatedAt",
     ).lean();
 
     const now = new Date();
@@ -37,7 +59,9 @@ class OpeningHoursService {
       if (openNow !== r.openNow) {
         ops.push({
           updateOne: {
-            filter: { _id: r._id },
+            // Only if nobody saved the restaurant since it was read (an admin
+            // edit recomputes openNow itself and must not be overwritten).
+            filter: { _id: r._id, openNow: r.openNow ?? null, updatedAt: r.updatedAt ?? null },
             update: { $set: { openNow } },
             timestamps: false, // a clock tick is not an edit
           },
@@ -53,6 +77,7 @@ class OpeningHoursService {
       { $set: { discountPercent: 0, discountEndsAt: null } },
       { timestamps: false },
     );
+    this.lastRefreshAt = startedAt;
     return ops.length;
   }
 
